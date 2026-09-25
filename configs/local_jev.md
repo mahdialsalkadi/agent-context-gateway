@@ -107,7 +107,7 @@ Relevant `.env` keys:
 | --- | --- | --- |
 | `CLASSIFIER_MODE` | — | set to `local_jev` |
 | `LOCAL_JEV_URL` | `http://127.0.0.1:11435/v1/chat/completions` | llama-server endpoint |
-| `CLASSIFIER_MODEL` | `jev-style-qwen3.5-2b` | label sent to the server |
+| `CLASSIFIER_MODEL` | `jev-style-qwen3.5-2b-q8_0` | label sent to the server |
 | `LOCAL_JEV_TIMEOUT_SECONDS` | `0.4` | verify budget before failing open |
 
 ## 4. Tuning the budget

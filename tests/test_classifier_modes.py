@@ -551,7 +551,7 @@ def test_local_jev_defaults_to_the_llama_server_endpoint():
 
     assert settings.effective_classifier_mode == CLASSIFIER_MODE_LOCAL_JEV
     assert settings.classifier_api_url == "http://127.0.0.1:11435/v1/chat/completions"
-    assert settings.classifier_model == "jev-style-qwen3.5-2b"
+    assert settings.classifier_model == "jev-style-qwen3.5-2b-q8_0"
     # A local model needs no credential, and must not be mistaken for a loop.
     assert settings.classifier_enabled is True
     assert settings.is_loop_upstream() is False

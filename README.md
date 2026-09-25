@@ -430,7 +430,7 @@ requiring the call to never happen.
 | --- | --- | --- |
 | `CLASSIFIER_MODE` | `auto` | `heuristics`, `upstream_reused`, `local_ollama`, `local_jev`, `external_jev` |
 | `CLASSIFIER_API_URL` | unset | Dedicated endpoint (`external_jev`) |
-| `CLASSIFIER_MODEL` | mode-dependent | `gpt-4o-mini`, `qwen2.5:0.5b` for `local_ollama`, `jev-style-qwen3.5-2b` for `local_jev` |
+| `CLASSIFIER_MODEL` | mode-dependent | `gpt-4o-mini`, `qwen2.5:0.5b` for `local_ollama`, `jev-style-qwen3.5-2b-q8_0` for `local_jev` |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local runner for `local_ollama` |
 | `LOCAL_JEV_URL` | `http://127.0.0.1:11435/v1/chat/completions` | `llama-server` endpoint for `local_jev` |
 | `LOCAL_JEV_TIMEOUT_SECONDS` | `0.4` | Verdict budget for `local_jev` before failing open |

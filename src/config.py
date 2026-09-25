@@ -60,7 +60,7 @@ DEFAULT_OLLAMA_CLASSIFIER_MODEL = "qwen2.5:0.5b"
 # chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF. It answers one letter per
 # request, so a verdict is a single forward pass and needs no API key.
 DEFAULT_LOCAL_JEV_URL = "http://127.0.0.1:11435/v1/chat/completions"
-DEFAULT_LOCAL_JEV_MODEL = "jev-style-qwen3.5-2b"
+DEFAULT_LOCAL_JEV_MODEL = "jev-style-qwen3.5-2b-q8_0"
 # Verdict budget for the local GGUF. A GPU-offloaded server (`-ngl 99`) is fast
 # enough that 0.4s is generous; a CPU-only host can raise it, at the cost of
 # waiting longer before falling back to the local heuristics.
