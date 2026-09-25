@@ -1,7 +1,14 @@
 # --- Secrets: never commit these -------------------------------------------
 .env
 .env.*
+# ...but the shipped, credential-free templates are part of the repo. Add your
+# own values to a copy (.env, or a new .env.<name>), never to these.
 !.env.example
+!.env.antigravity
+!.env.claude
+!.env.codex
+!.env.hermes
+!.env.openrouter
 *.pem
 *.key
 *.p12

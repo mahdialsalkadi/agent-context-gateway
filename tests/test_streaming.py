@@ -32,6 +32,7 @@ from tests.mock_upstream import (
     escape_stream,
     finish_delta,
     openai_stream,
+    sse,
     text_delta,
     tool_delta,
 )
@@ -755,3 +756,139 @@ async def test_health_endpoint_reports_redacted_config(api):
     # A redacted snapshot must never carry the secret itself.
     assert "test-upstream-key" not in json.dumps(payload)
     assert "classifier_enabled" in payload
+    assert payload["classifier_mode"] in (
+        "heuristics",
+        "upstream_reused",
+        "local_ollama",
+        "external_jev",
+    )
+
+
+# ------------------------------------------------------------------------------
+# Opt-in Anthropic thinking passthrough
+# ------------------------------------------------------------------------------
+def reasoning_delta(text: str, key: str = "reasoning_content") -> bytes:
+    """An OpenAI chunk carrying reasoning text in one of the shapes seen live."""
+    return sse(
+        {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "model": "mock-model",
+            "choices": [{"index": 0, "delta": {key: text}, "finish_reason": None}],
+        }
+    )
+
+
+def reasoning_then_text(key: str = "reasoning_content") -> list:
+    return [
+        reasoning_delta("step one. ", key),
+        reasoning_delta("step two.", key),
+        text_delta("The answer."),
+        finish_delta("stop"),
+        done(),
+    ]
+
+
+async def translate(frames, thinking: bool = False):
+    async def gen():
+        for frame in frames:
+            yield frame
+
+    return [
+        frame
+        async for frame in translate_stream(
+            gen(), "claude-sonnet-4", 11, None, thinking
+        )
+    ]
+
+
+def block_starts(events):
+    return [json.loads(data) for name, data in events if name == "content_block_start"]
+
+
+def deltas_of(events, delta_type: str) -> str:
+    return "".join(
+        json.loads(data)["delta"].get("text") or json.loads(data)["delta"].get("thinking") or ""
+        for name, data in events
+        if name == "content_block_delta"
+        and json.loads(data)["delta"]["type"] == delta_type
+    )
+
+
+async def test_reasoning_is_dropped_by_default():
+    """Default must stay unchanged: unsigned thinking blocks can break clients."""
+    events = parse_sse(b"".join(await translate(reasoning_then_text())))
+
+    starts = block_starts(events)
+    assert starts, "the response should still carry content blocks"
+    assert all(start["content_block"]["type"] == "text" for start in starts)
+    assert deltas_of(events, "thinking_delta") == ""
+    assert deltas_of(events, "text_delta") == "The answer."
+
+
+async def test_thinking_passthrough_emits_a_thinking_block_first():
+    events = parse_sse(b"".join(await translate(reasoning_then_text(), thinking=True)))
+
+    starts = block_starts(events)
+    assert starts[0]["content_block"]["type"] == "thinking"
+    assert starts[0]["index"] == 0, "thinking must precede text, as Anthropic requires"
+    assert any(start["content_block"]["type"] == "text" for start in starts)
+
+    assert deltas_of(events, "thinking_delta") == "step one. step two."
+    assert deltas_of(events, "text_delta") == "The answer."
+    # Block order is observable through the index sequence.
+    assert [start["content_block"]["type"] for start in starts] == ["thinking", "text"]
+
+
+@pytest.mark.parametrize("key", ["reasoning_content", "reasoning", "thinking"])
+async def test_thinking_passthrough_handles_every_reasoning_key(key):
+    events = parse_sse(
+        b"".join(await translate(reasoning_then_text(key), thinking=True))
+    )
+    assert deltas_of(events, "thinking_delta") == "step one. step two."
+
+
+async def test_thinking_passthrough_handles_a_part_list():
+    frames = [
+        sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning": [{"type": "text", "text": "part a"}]},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        ),
+        text_delta("done"),
+        finish_delta("stop"),
+        done(),
+    ]
+    events = parse_sse(b"".join(await translate(frames, thinking=True)))
+    assert deltas_of(events, "thinking_delta") == "part a"
+
+
+def test_non_streaming_thinking_passthrough_is_opt_in():
+    payload = {
+        "choices": [{"message": {"content": "Answer.", "reasoning_content": "because"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+    }
+
+    default = openai_to_anthropic_response(payload, "m")
+    assert [block["type"] for block in default["content"]] == ["text"]
+
+    enabled = openai_to_anthropic_response(payload, "m", True)
+    assert enabled["content"][0] == {"type": "thinking", "thinking": "because"}
+    assert enabled["content"][1]["type"] == "text"
+    assert enabled["content"][1]["text"] == "Answer."
+
+
+def test_anthropic_profile_exposes_thinking_passthrough_setting():
+    from src.config import load_settings
+
+    assert load_settings(env={}).anthropic_thinking_passthrough is False
+    assert (
+        load_settings(env={"ANTHROPIC_THINKING_PASSTHROUGH": "1"}).anthropic_thinking_passthrough
+        is True
+    )

@@ -73,7 +73,9 @@ want, but should be a deliberate choice.
 ### Hermes Agent
 
 Add a provider entry to `~/.hermes/config.yaml` and select it; do not repoint
-your existing default until you have verified the gateway works.
+your existing default until you have verified the gateway works. There is a
+fuller walkthrough in [`configs/hermes.md`](hermes.md), including the
+`--profile hermes` route.
 
 ```yaml
 custom_providers:
@@ -145,5 +147,27 @@ otherwise, because:
 - the model can always ask for its tools back with `[ESCAPE_NEED_TOOLS]`,
 - any classifier failure keeps the tools.
 
-If you would rather never prune, disable the classifier and make your prompts
-look like work — or simply send `x-agent-gateway-bypass: true`.
+If you would rather never prune, set `CLASSIFIER_MODE=heuristics` and make your
+prompts look like work — or simply send `x-agent-gateway-bypass: true`.
+
+## 7. Choose where routing decisions come from
+
+`CLASSIFIER_MODE` decides, and every mode is free of extra credentials:
+
+| Mode | Decision source | Cost |
+| --- | --- | --- |
+| `heuristics` | local regex/keyword rules, no network | `$0` |
+| `upstream_reused` | a fast model on the upstream you already use | `$0` extra |
+| `local_ollama` | a model on this machine | `$0`, and private |
+| `external_jev` | a dedicated endpoint | that endpoint's pricing |
+
+```bash
+# Framework with a fixed tool list and a quota to protect:
+CLASSIFIER_MODE=heuristics python -m src.gateway
+
+# Or start from a provider profile instead of .env:
+python -m src.gateway --profile antigravity
+python -m src.gateway --list-profiles
+```
+
+See the matrix in the [README](../README.md#supported-providers).

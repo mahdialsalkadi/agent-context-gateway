@@ -24,7 +24,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 
 import httpx
 
-from .config import ESCAPE_INSTRUCTION, ESCAPE_TOKEN, Settings
+from .config import (
+    CLASSIFIER_MODE_EXTERNAL_JEV,
+    CLASSIFIER_MODE_HEURISTICS,
+    CLASSIFIER_MODE_LOCAL_OLLAMA,
+    CLASSIFIER_MODE_UPSTREAM_REUSED,
+    ESCAPE_INSTRUCTION,
+    ESCAPE_TOKEN,
+    Settings,
+)
 
 # ------------------------------------------------------------------------------
 # Heuristics
@@ -214,12 +222,23 @@ class Decision:
 class Classifier:
     """Optional LLM classifier with a short-lived decision cache.
 
+    One class, four strategies, chosen by `settings.effective_classifier_mode`:
+
+    * `heuristics`      -- never touches the network. `ask()` returns None, which
+      makes every ambiguous turn fail open and keep its tools.
+    * `upstream_reused` -- the endpoint and credential are the upstream's own, so
+      a verdict costs nothing beyond the subscription already in use.
+    * `local_ollama`    -- a local runner; same OpenAI payload shape, no internet.
+    * `external_jev`    -- a dedicated endpoint (OpenRouter/OpenCode), where the
+      `blueprint` protocol is also available.
+
     Construct once per process. All network access is funnelled through `_post`
     so tests can substitute a transport without patching httpx globally.
     """
 
     def __init__(self, settings: Settings, cache_ttl: float = 300.0) -> None:
         self.settings = settings
+        self.mode = settings.effective_classifier_mode
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, bool]] = {}
         self.calls = 0
@@ -261,7 +280,7 @@ class Classifier:
 
     # --- core --------------------------------------------------------------
     def _build_payload(self, instruction: str, state: str, key: str) -> Dict[str, Any]:
-        if self.settings.classifier_protocol == "blueprint":
+        if self.settings.classifier_protocol == "blueprint" and self.mode == CLASSIFIER_MODE_EXTERNAL_JEV:
             # The original spec's custom shape. No standard endpoint returns it,
             # which is why `openai` is the default; it is kept for compatible
             # self-hosted classifiers.
@@ -275,6 +294,9 @@ class Classifier:
             "model": self.settings.classifier_model,
             "temperature": 0,
             "max_tokens": 32,
+            # Explicit, so a server that streams by default cannot turn a 32-token
+            # verdict into an SSE body the parser would then have to unwrap.
+            "stream": False,
             "messages": [
                 {
                     "role": "system",
@@ -295,7 +317,9 @@ class Classifier:
     ) -> Optional[bool]:
         """Ask the classifier a yes/no question. None means "could not ask"."""
         settings = self.settings
-        if not settings.classifier_enabled:
+        if self.mode == CLASSIFIER_MODE_HEURISTICS or not settings.classifier_enabled:
+            # Belt and braces: `heuristics` must issue zero network calls even if an
+            # endpoint somehow leaked into the configuration.
             return None
 
         cache_key = self._cache_key(key, state)
@@ -310,22 +334,34 @@ class Classifier:
         if data is None:
             return None
 
-        # Blueprint shape: a calibrated probability.
-        answers = data.get("answers") if isinstance(data, dict) else None
-        if isinstance(answers, dict):
-            entry = answers.get(key)
-            if isinstance(entry, dict):
-                probability = entry.get("probability")
-                if isinstance(probability, (int, float)):
-                    verdict = float(probability) >= threshold
-                    self._cache_put(cache_key, verdict)
-                    return verdict
-
-        # OpenAI shape: a boolean in the assistant text.
-        verdict = parse_classifier_bool(reply_text(data), key)
+        # Blueprint shape first (a calibrated probability), then the OpenAI
+        # shape (a boolean in the assistant text).
+        verdict = self._interpret_probability(data, key, threshold)
+        if verdict is None:
+            verdict = parse_classifier_bool(reply_text(data), key)
         if verdict is not None:
             self._cache_put(cache_key, verdict)
         return verdict
+
+    @staticmethod
+    def _interpret_probability(
+        data: Any, key: str, threshold: float
+    ) -> Optional[bool]:
+        """Read the `blueprint` reply shape, or None if it is not that shape.
+
+        Split out from `ask` so the calibrated-probability protocol can be
+        exercised without a network round trip.
+        """
+        answers = data.get("answers") if isinstance(data, dict) else None
+        if not isinstance(answers, dict):
+            return None
+        entry = answers.get(key)
+        if not isinstance(entry, dict):
+            return None
+        probability = entry.get("probability")
+        if isinstance(probability, (int, float)):
+            return float(probability) >= threshold
+        return None
 
     # --- domain questions --------------------------------------------------
     async def needs_tools(self, prompt: str) -> Optional[bool]:
@@ -404,6 +440,7 @@ _CLASSIFIER_KEY: Optional[tuple] = None
 
 def _classifier_key(settings: Settings) -> tuple:
     return (
+        settings.effective_classifier_mode,
         settings.classifier_api_url,
         settings.classifier_api_key,
         settings.classifier_model,
@@ -422,9 +459,11 @@ def configure(classifier: Classifier) -> Classifier:
 
 
 def get_classifier(settings: Optional[Settings] = None) -> Classifier:
-    """Return the process-wide classifier, rebuilding it if the config changed.
+    """Return the process-wide classifier for the active mode.
 
-    Keyed on the classifier-relevant settings: a cached instance built from a
+    The mode is resolved from configuration, so switching profiles changes the
+    strategy on the next call without restarting anything. Keyed on the
+    classifier-relevant settings (mode included): a cached instance built from a
     different configuration would silently route with the wrong policy.
     """
     global _CLASSIFIER, _CLASSIFIER_KEY
@@ -442,6 +481,10 @@ def get_classifier(settings: Optional[Settings] = None) -> Classifier:
 __all__ = [
     "Decision",
     "Classifier",
+    "CLASSIFIER_MODE_EXTERNAL_JEV",
+    "CLASSIFIER_MODE_HEURISTICS",
+    "CLASSIFIER_MODE_LOCAL_OLLAMA",
+    "CLASSIFIER_MODE_UPSTREAM_REUSED",
     "ESCAPE_INSTRUCTION",
     "ESCAPE_TOKEN",
     "decide_route",

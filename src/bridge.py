@@ -16,8 +16,13 @@ cheap to unit test. Coverage targets the shapes agents actually send:
 * `tool_choice` in all four Anthropic forms
 * streaming: OpenAI `delta` frames -> Anthropic `content_block_*` events
 
-Not translated (documented rather than silently dropped): extended-thinking
-blocks, `cache_control` hints, and audio/document content blocks.
+Reasoning text is translated only when `ANTHROPIC_THINKING_PASSTHROUGH` is on:
+Anthropic models expect a `signature` that an OpenAI-shaped upstream cannot
+supply, and a strict client rejects an unsigned thinking block. Off by default,
+so nothing is fabricated.
+
+Still not translated (documented rather than silently dropped): `cache_control`
+hints, and audio/document content blocks.
 """
 
 from __future__ import annotations
@@ -290,13 +295,46 @@ def _tool_use_block(call: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def openai_to_anthropic_response(payload: Dict[str, Any], model: str = "") -> Dict[str, Any]:
+def _reasoning_text(container: Dict[str, Any]) -> str:
+    """Extract reasoning text from the several shapes providers use.
+
+    `reasoning_content` is DeepSeek/vLLM, `reasoning` is OpenRouter, and some
+    gateways emit `thinking`, or an OpenAI-style list of parts instead of a
+    plain string. Returns "" when there is nothing to forward.
+    """
+    if not isinstance(container, dict):
+        return ""
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = container.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list):
+            joined = "".join(
+                part.get("text", "")
+                for part in value
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+            if joined:
+                return joined
+    return ""
+
+
+def openai_to_anthropic_response(
+    payload: Dict[str, Any], model: str = "", thinking_passthrough: bool = False
+) -> Dict[str, Any]:
     """Convert a non-streaming OpenAI completion into an Anthropic message."""
     choices = payload.get("choices") or [{}]
     choice = choices[0] if isinstance(choices[0], dict) else {}
     message = choice.get("message") or {}
 
     content: List[Dict[str, Any]] = []
+    if thinking_passthrough:
+        reasoning = _reasoning_text(message)
+        if reasoning:
+            # No signature is available from an OpenAI-shaped upstream, so this
+            # is opt-in; see the module docstring.
+            content.append({"type": "thinking", "thinking": reasoning})
+
     text = message.get("content")
     if isinstance(text, str) and text:
         content.append({"type": "text", "text": text})
@@ -364,6 +402,17 @@ def _json_delta_frame(index: int, partial: str) -> bytes:
     )
 
 
+def _thinking_delta_frame(index: int, text: str) -> bytes:
+    return sse_frame(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": text},
+        },
+    )
+
+
 class AnthropicStreamTranslator:
     """Stateful OpenAI-SSE -> Anthropic-SSE converter.
 
@@ -372,16 +421,20 @@ class AnthropicStreamTranslator:
     blocks, while OpenAI just emits an undifferentiated delta sequence.
     """
 
-    def __init__(self, model: str, input_tokens: int = 0) -> None:
+    def __init__(
+        self, model: str, input_tokens: int = 0, thinking_passthrough: bool = False
+    ) -> None:
         self.model = model
         self.input_tokens = input_tokens
+        self.thinking_passthrough = bool(thinking_passthrough)
         self._buffer = ""
         self._started = False
         self._finished = False
         self._block_index = -1
-        self._open_kind: Optional[str] = None  # "text" | "tool"
+        self._open_kind: Optional[str] = None  # "thinking" | "text" | "tool"
         self._tool_slots: Dict[int, int] = {}  # openai tool index -> an block index
         self._text_chars = 0
+        self._thinking_chars = 0
         self._stop_reason = "end_turn"
         self._message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -436,6 +489,23 @@ class AnthropicStreamTranslator:
         frames.append(_text_delta_frame(self._block_index, text))
         return frames
 
+    def _on_thinking(self, text: str) -> List[bytes]:
+        """Emit upstream reasoning as an Anthropic `thinking` block.
+
+        Opt-in: Anthropic models expect a `signature` that an OpenAI-shaped
+        upstream cannot supply, and a strict client rejects an unsigned block.
+        Dropping reasoning stays the default because it can never break a client.
+        """
+        frames: List[bytes] = []
+        if self._open_kind != "thinking":
+            frames.append(self._close_block())
+            frames.append(
+                self._open_block("thinking", {"type": "thinking", "thinking": ""})
+            )
+        self._thinking_chars += len(text)
+        frames.append(_thinking_delta_frame(self._block_index, text))
+        return frames
+
     def _on_tool_call(self, call: Dict[str, Any]) -> List[bytes]:
         frames: List[bytes] = []
         slot = int(call.get("index", 0) or 0)
@@ -468,6 +538,13 @@ class AnthropicStreamTranslator:
 
         if choice.get("finish_reason"):
             self._stop_reason = STOP_REASON_MAP.get(choice["finish_reason"], "end_turn")
+
+        if self.thinking_passthrough:
+            # Reasoning precedes the answer, so it is emitted before any text or
+            # tool block is opened -- which is also the order Anthropic requires.
+            reasoning = _reasoning_text(delta)
+            if reasoning:
+                frames.extend(self._on_thinking(reasoning))
 
         text = delta.get("content")
         if isinstance(text, str) and text:
@@ -577,6 +654,7 @@ async def translate_stream(
     model: str,
     input_tokens: int = 0,
     on_upstream_chunk: Optional[Callable[[bytes], None]] = None,
+    thinking_passthrough: bool = False,
 ) -> AsyncIterator[bytes]:
     """Adapt an OpenAI SSE byte stream into an Anthropic SSE byte stream.
 
@@ -584,7 +662,7 @@ async def translate_stream(
     the original OpenAI deltas for memory ingestion while the client receives
     fully translated Anthropic events.
     """
-    translator = AnthropicStreamTranslator(model, input_tokens)
+    translator = AnthropicStreamTranslator(model, input_tokens, thinking_passthrough)
     async for chunk in source:
         if on_upstream_chunk is not None:
             try:

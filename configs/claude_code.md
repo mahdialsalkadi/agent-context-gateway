@@ -9,11 +9,13 @@ request into an OpenAI chat-completions call, so all the context management
 
 ```bash
 cd agent-context-gateway
-cp .env.example .env
-$EDITOR .env      # set UPSTREAM_BASE_URL + UPSTREAM_API_KEY
-python -m src.gateway
-curl -s http://127.0.0.1:8090/health | python -m json.tool
+python -m src.gateway --profile claude
+curl -s http://127.0.0.1:8091/health | python -m json.tool
 ```
+
+The `claude` profile (`.env.claude`) listens on **8091** and is the fastest route.
+Edit it to set `UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY`; everything else already
+works. Prefer a plain file? `cp .env.example .env && python -m src.gateway`.
 
 ## 2. Point Claude Code at it
 
@@ -21,7 +23,7 @@ curl -s http://127.0.0.1:8090/health | python -m json.tool
 `/v1/messages` itself.
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8090
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8091
 export ANTHROPIC_API_KEY=dummy        # gateway injects the real upstream key
 claude
 ```
@@ -100,12 +102,51 @@ answers with a character-based estimate. It is approximate by design: exact
 counts would require the upstream to expose a tokenizer for a model it may not
 even host. This only affects the display, not billing.
 
+## 6. Routing mode (and cost)
+
+The profile ships with `CLASSIFIER_MODE=heuristics`: routing decisions come from
+local regex and keyword rules in well under a millisecond, with no network call
+at all. Ambiguous turns fail open, so a tool schema is never dropped by mistake.
+
+To get judgement calls from a model instead, reuse whichever provider you already
+pay for:
+
+```bash
+# classify on the same subscription as the upstream -- no second provider
+CLASSIFIER_MODE=upstream_reused
+CLASSIFIER_MODEL=claude-3-5-haiku
+```
+
+A local runner works the same way with `CLASSIFIER_MODE=local_ollama`, and a
+dedicated endpoint with `CLASSIFIER_MODE=external_jev`. See the README matrix.
+
+Context handling under this profile: bash/file tool outputs are pruned and
+spilled to disk with a retrievable handle, and learned facts are injected into
+later turns. Thinking blocks are covered below.
+
+## 7. Thinking blocks
+
+Reasoning text from the upstream is **not** re-emitted as Anthropic `thinking`
+blocks by default. Anthropic models expect a `signature` alongside thinking
+content, an OpenAI-shaped upstream cannot supply one, and a strict client rejects
+an unsigned block — so emitting one would break the stream it is meant to enrich.
+
+Dropping reasoning is therefore the safe default and never breaks a client. If
+your client tolerates unsigned blocks, opt in:
+
+```bash
+ANTHROPIC_THINKING_PASSTHROUGH=1
+```
+
+`reasoning_content`, `reasoning` and `thinking` fields are all recognised, and
+the thinking block is emitted before the answer text, in the order the Anthropic
+event model requires.
+
 ## What is not translated
 
-- **Extended-thinking blocks** are dropped rather than mangled.
 - **`cache_control` hints** are ignored (OpenAI has no equivalent).
 - **Audio and document content blocks** are dropped; text and base64/URL images
   are translated.
 
-If your workflow depends on any of those, keep Claude Code pointed at Anthropic
+If your workflow depends on either, keep Claude Code pointed at Anthropic
 directly and use the gateway for an OpenAI-compatible agent instead.

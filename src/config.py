@@ -29,6 +29,30 @@ DEFAULT_CLASSIFIER_PROTOCOL = "openai"
 DEFAULT_CLASSIFIER_TIMEOUT = 2.5
 DEFAULT_NEEDS_TOOLS_THRESHOLD = 0.15
 DEFAULT_SUPERSEDE_THRESHOLD = 0.75
+DEFAULT_CLASSIFIER_MODEL = "gpt-4o-mini"
+
+# ------------------------------------------------------------------------------
+# Classifier routing modes
+# ------------------------------------------------------------------------------
+# `CLASSIFIER_MODE` selects where a routing verdict comes from. All four modes
+# are first-class and none is required: the local heuristics always run first and
+# an unreachable classifier always fails open.
+CLASSIFIER_MODE_HEURISTICS = "heuristics"
+CLASSIFIER_MODE_UPSTREAM_REUSED = "upstream_reused"
+CLASSIFIER_MODE_LOCAL_OLLAMA = "local_ollama"
+CLASSIFIER_MODE_EXTERNAL_JEV = "external_jev"
+CLASSIFIER_MODES = (
+    CLASSIFIER_MODE_HEURISTICS,
+    CLASSIFIER_MODE_UPSTREAM_REUSED,
+    CLASSIFIER_MODE_LOCAL_OLLAMA,
+    CLASSIFIER_MODE_EXTERNAL_JEV,
+)
+# Unset (or `auto`) preserves the original behaviour exactly: an explicitly
+# configured endpoint and key mean the external classifier, otherwise heuristics.
+CLASSIFIER_MODE_AUTO = "auto"
+
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_OLLAMA_CLASSIFIER_MODEL = "qwen2.5:0.5b"
 
 DEFAULT_TRUNCATE_CHARS = 800
 DEFAULT_SNIFF_LIMIT = 512
@@ -52,12 +76,60 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+PROFILE_PREFIX = ".env."
+
+
+def profile_candidates(name: str) -> List[Path]:
+    """Places a named profile (`<PROFILE_PREFIX><name>`) is looked for, in order."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", name or "").lstrip(".")
+    if not safe:
+        return []
+    return [
+        Path.cwd() / f"{PROFILE_PREFIX}{safe}",
+        _repo_root() / f"{PROFILE_PREFIX}{safe}",
+        Path(f"~/.agent-gateway/{PROFILE_PREFIX}{safe}").expanduser(),
+    ]
+
+
+def find_profile(name: str) -> Optional[Path]:
+    """Locate a profile file, or None when it does not exist anywhere."""
+    for candidate in profile_candidates(name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def available_profiles() -> List[str]:
+    """Names of discoverable profiles, for `--list-profiles`."""
+    names = set()
+    for root in (Path.cwd(), _repo_root(), Path("~/.agent-gateway").expanduser()):
+        try:
+            found = list(root.glob(f"{PROFILE_PREFIX}*"))
+        except OSError:
+            continue
+        for path in found:
+            name = path.name[len(PROFILE_PREFIX):]
+            if not name or name == "example":
+                continue
+            if path.is_file():
+                names.add(name)
+    return sorted(names)
+
+
 def env_file_candidates() -> List[Path]:
-    """Places a `.env` is looked for, in order."""
+    """Places a `.env` is looked for, in order.
+
+    An explicitly requested profile (`--profile x`, or `AGENT_GATEWAY_PROFILE=x`)
+    outranks the plain `.env`: naming a profile is a deliberate act, so it should
+    not be quietly overridden by a leftover default file.
+    """
     candidates: List[Path] = []
     explicit = os.environ.get("AGENT_GATEWAY_ENV")
     if explicit:
         candidates.append(Path(explicit).expanduser())
+    profile = os.environ.get("AGENT_GATEWAY_PROFILE")
+    if profile:
+        candidates.extend(profile_candidates(profile))
     candidates.append(Path.cwd() / ".env")
     candidates.append(_repo_root() / ".env")
     candidates.append(Path("~/.agent-gateway/.env").expanduser())
@@ -178,6 +250,18 @@ class Settings:
     classifier_timeout: float = DEFAULT_CLASSIFIER_TIMEOUT
     classifier_needs_tools_threshold: float = DEFAULT_NEEDS_TOOLS_THRESHOLD
     classifier_supersede_threshold: float = DEFAULT_SUPERSEDE_THRESHOLD
+    # `auto` derives the mode from what is configured, so an existing deployment
+    # keeps working without setting CLASSIFIER_MODE at all.
+    classifier_mode: str = CLASSIFIER_MODE_AUTO
+
+    # Allow UPSTREAM_BASE_URL to target a port in LEGACY_PROXY_PORTS. Required for
+    # local subscription bridges that live on 8080 (Antigravity, Copilot).
+    allow_legacy_upstream: bool = False
+
+    # Forward upstream reasoning text as Anthropic `thinking` blocks. Off by
+    # default: unverified signatures can make strict Anthropic clients reject the
+    # stream, and dropping reasoning is the safe, long-standing behaviour.
+    anthropic_thinking_passthrough: bool = False
 
     # Claude Code asks for `claude-*` model ids. If your upstream does not serve
     # those names, this replaces the model on the Anthropic surface only.
@@ -212,8 +296,33 @@ class Settings:
         return f"{self.host}:{self.port}"
 
     @property
+    def effective_classifier_mode(self) -> str:
+        """The mode actually in force, resolving `auto` from the environment.
+
+        An unrecognised value resolves like `auto` rather than crashing, so a
+        typo degrades to a working default; `/health` reports the effective mode,
+        which is where the typo becomes visible.
+        """
+        mode = (self.classifier_mode or "").strip().lower()
+        if mode in CLASSIFIER_MODES:
+            return mode
+        return (
+            CLASSIFIER_MODE_EXTERNAL_JEV
+            if (self.classifier_api_url and self.classifier_api_key)
+            else CLASSIFIER_MODE_HEURISTICS
+        )
+
+    @property
     def classifier_enabled(self) -> bool:
-        return bool(self.classifier_api_key and self.classifier_api_url)
+        """True when ambiguous turns should reach a model at all."""
+        mode = self.effective_classifier_mode
+        if mode == CLASSIFIER_MODE_HEURISTICS or not self.classifier_api_url:
+            return False
+        if mode in (CLASSIFIER_MODE_UPSTREAM_REUSED, CLASSIFIER_MODE_LOCAL_OLLAMA):
+            # Local bridges and subscription gateways commonly ignore the bearer
+            # token, so a missing key must not silently disable classification.
+            return True
+        return bool(self.classifier_api_key)
 
     # --- safety ------------------------------------------------------------
     def ensure_dirs(self) -> None:
@@ -224,9 +333,18 @@ class Settings:
                 pass
 
     def forbidden_upstreams(self) -> set:
-        """(host, port) pairs the upstream may never resolve to."""
+        """(host, port) pairs the upstream may never resolve to.
+
+        The gateway's own listen address is always forbidden -- that is the
+        infinite loop. The legacy proxy ports are forbidden too, but only as a
+        heuristic guess that something proxy-shaped lives there. Local
+        subscription bridges genuinely occupy 8080, so `ALLOW_LEGACY_UPSTREAM_PORT`
+        relaxes the guess without relaxing the real loop guard.
+        """
         hosts = {self.host.lower(), "127.0.0.1", "localhost", "0.0.0.0", "::1"}
-        ports = {self.port, *LEGACY_PROXY_PORTS}
+        ports = {self.port}
+        if not self.allow_legacy_upstream:
+            ports.update(LEGACY_PROXY_PORTS)
         return {(host, port) for host in hosts for port in ports}
 
     def is_loop_upstream(self, url: Optional[str] = None) -> bool:
@@ -252,6 +370,7 @@ class Settings:
             "upstream_key": bool(self.upstream_api_key),
             "gateway_auth": bool(self.gateway_api_key),
             "classifier_enabled": self.classifier_enabled,
+            "classifier_mode": self.effective_classifier_mode,
             "classifier_url": self.classifier_api_url or None,
             "classifier_model": self.classifier_model if self.classifier_enabled else None,
             "classifier_protocol": self.classifier_protocol if self.classifier_enabled else None,
@@ -260,6 +379,10 @@ class Settings:
             "log_dir": str(self.log_dir),
             "shm_cache_dir": str(self.shm_cache_dir),
             "memory_injection": self.memory_injection,
+            "anthropic_thinking_passthrough": self.anthropic_thinking_passthrough,
+            "allow_legacy_upstream": self.allow_legacy_upstream,
+            "profile": os.environ.get("AGENT_GATEWAY_PROFILE") or None,
+            "env_file": str(self.env_file) if self.env_file else None,
         }
 
 
@@ -308,6 +431,44 @@ def load_settings(
         env,
     )
 
+    # --- classifier mode ---------------------------------------------------
+    # Each mode decides where the endpoint, credential and model come from. The
+    # legacy variables keep working untouched, so `auto` is a pure no-op.
+    raw_mode = _first(env, ("CLASSIFIER_MODE",), "").strip().lower()
+    resolved_mode = raw_mode if raw_mode in CLASSIFIER_MODES else CLASSIFIER_MODE_AUTO
+    classifier_model = _first(
+        env, ("CLASSIFIER_MODEL", "JEV_MODEL"), DEFAULT_CLASSIFIER_MODEL
+    )
+    classifier_protocol = _first(
+        env, ("CLASSIFIER_PROTOCOL", "JEV_PROTOCOL"), DEFAULT_CLASSIFIER_PROTOCOL
+    ).lower()
+
+    if resolved_mode == CLASSIFIER_MODE_HEURISTICS:
+        # Zero network, unconditionally. Blank the endpoint rather than merely
+        # ignoring it, so no code path -- and no future refactor -- can reach out.
+        classifier_url = ""
+        classifier_key = ""
+    elif resolved_mode == CLASSIFIER_MODE_UPSTREAM_REUSED:
+        # Reuse the subscription already being paid for, on the host already
+        # being talked to: same credential, same quota, no second bill.
+        classifier_url = classifier_url or f"{upstream_base}/chat/completions"
+        classifier_key = classifier_key or upstream_key
+        classifier_protocol = DEFAULT_CLASSIFIER_PROTOCOL
+    elif resolved_mode == CLASSIFIER_MODE_LOCAL_OLLAMA:
+        ollama_base = sanitize_url(
+            _first(env, ("OLLAMA_BASE_URL",), DEFAULT_OLLAMA_BASE_URL)
+        ).rstrip("/")
+        classifier_url = classifier_url or f"{ollama_base}/chat/completions"
+        classifier_key = classifier_key or "ollama"
+        classifier_model = (
+            _first(env, ("CLASSIFIER_MODEL", "JEV_MODEL"), "")
+            or DEFAULT_OLLAMA_CLASSIFIER_MODEL
+        )
+        classifier_protocol = DEFAULT_CLASSIFIER_PROTOCOL
+    elif resolved_mode == CLASSIFIER_MODE_EXTERNAL_JEV:
+        # Unchanged: a dedicated endpoint, and `blueprint` remains available.
+        pass
+
     extra_regex = _first(env, ("REASONING_MODEL_REGEX",), "")
 
     return Settings(
@@ -325,12 +486,15 @@ def load_settings(
         gateway_api_key=_first(env, ("GATEWAY_API_KEY",), ""),
         classifier_api_url=classifier_url,
         classifier_api_key=classifier_key,
-        classifier_model=_first(
-            env, ("CLASSIFIER_MODEL", "JEV_MODEL"), "gpt-4o-mini"
+        classifier_model=classifier_model,
+        classifier_protocol=classifier_protocol,
+        classifier_mode=raw_mode or CLASSIFIER_MODE_AUTO,
+        allow_legacy_upstream=_as_bool(
+            _first(env, ("ALLOW_LEGACY_UPSTREAM_PORT",), ""), False
         ),
-        classifier_protocol=_first(
-            env, ("CLASSIFIER_PROTOCOL", "JEV_PROTOCOL"), DEFAULT_CLASSIFIER_PROTOCOL
-        ).lower(),
+        anthropic_thinking_passthrough=_as_bool(
+            _first(env, ("ANTHROPIC_THINKING_PASSTHROUGH",), ""), False
+        ),
         classifier_timeout=_as_float(
             _first(env, ("CLASSIFIER_TIMEOUT_SECONDS", "JEV_TIMEOUT"), ""),
             DEFAULT_CLASSIFIER_TIMEOUT,

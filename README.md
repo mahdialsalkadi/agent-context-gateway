@@ -11,8 +11,14 @@ long agent sessions expensive and flaky:
 | Naive proxies buffer the whole stream to inspect it | **Streams chunk-in/chunk-out** with a bounded look-ahead, so pruning costs you no latency |
 | Facts learned in one session are gone in the next | **Builds a self-pruning knowledge graph** that decays, graduates and gets injected into later prompts |
 
-Works with **Claude Code, Aider, Cursor, Hermes, or any OpenAI SDK client** — no
-vendor lock-in, no agent-specific code, no hardcoded paths.
+Works with **Claude Code, Aider, Cursor, Codex/Copilot bridges, Google
+Antigravity, Hermes, or any OpenAI SDK client** — no vendor lock-in, no
+agent-specific code, no hardcoded paths.
+
+**And it can run for $0.** Every routing decision is available in a mode that
+reuses a subscription you already pay for, or a model already running on your
+own machine — no second provider, no second key. See
+[Zero-cost mode](#zero-cost-mode).
 
 ```bash
 cp .env.example .env      # set UPSTREAM_BASE_URL + UPSTREAM_API_KEY
@@ -20,6 +26,19 @@ pip install -r requirements.txt
 python -m src.gateway
 # -> listening on http://127.0.0.1:8090/v1
 ```
+
+Or start from a ready-made provider profile:
+
+```bash
+python -m src.gateway --profile antigravity   # Google Antigravity bridge (8080)
+python -m src.gateway --profile claude        # Claude Code / Anthropic surface
+python -m src.gateway --profile codex         # Codex / GitHub Copilot bridge
+python -m src.gateway --profile hermes        # Hermes Agent
+python -m src.gateway --profile openrouter    # OpenRouter direct
+python -m src.gateway --list-profiles         # what is available
+```
+
+No `--profile` flag means `.env`, exactly as before.
 
 > **Compatibility note.** The OpenAI surface (`/v1/chat/completions`) works with
 > every OpenAI-compatible client. The Anthropic surface (`/v1/messages`) exists
@@ -31,6 +50,9 @@ python -m src.gateway
 ## Contents
 
 - [Architecture](#architecture)
+- [Supported providers](#supported-providers)
+- [Zero-cost mode](#zero-cost-mode)
+- [Profiles](#profiles)
 - [Quickstart](#quickstart)
 - [Configuration](#configuration)
 - [Connecting your agent](#connecting-your-agent)
@@ -47,8 +69,10 @@ python -m src.gateway
    Claude Code ──┐
    Aider ────────┤
    Cursor ───────┤   /v1/chat/completions  (OpenAI)
-   LangChain ────┼──▶  /v1/messages        (Anthropic, translated)
-   Hermes ───────┘     /v1/models | /health
+   Copilot bridge┤   /v1/messages        (Anthropic, translated)
+   Antigravity ──┼──▶  /v1/models | /health
+   LangChain ────┤
+   Hermes ───────┘
                               │
                     ┌─────────▼──────────┐
                     │   src/gateway.py   │  routing · streaming · telemetry
@@ -56,8 +80,8 @@ python -m src.gateway
               ┌───────────────┼───────────────┬────────────────┐
               ▼               ▼               ▼                ▼
       classifier.py     artifacts.py      memory.py       bridge.py
-      heuristics +      RAM-disk spill    SQLite graph    Anthropic ⇄
-      LLM fallback      + fetch_log       (WAL+decay)     OpenAI
+      4 routing modes   RAM-disk spill    SQLite graph    Anthropic ⇄
+      (see below)       + fetch_log       (WAL+decay)     OpenAI
                               │
                     ┌─────────▼──────────┐
                     │  src/sentinel.py   │  watchdog · prune · compact · rotate
@@ -69,7 +93,7 @@ python -m src.gateway
 | Module | Responsibility |
 | --- | --- |
 | `src/config.py` | Every path and credential, resolved from the environment |
-| `src/classifier.py` | Heuristics, LLM classifier, routing policy, decision cache |
+| `src/classifier.py` | Four routing modes, heuristics, decision cache |
 | `src/artifacts.py` | Spillover store, content-hash handles, `fetch_log` resolution |
 | `src/memory.py` | Knowledge graph: extraction, decay, graduation, compaction |
 | `src/bridge.py` | Anthropic ⇄ OpenAI request/response/SSE translation |
@@ -87,7 +111,10 @@ python -m src.gateway
 These are enforced by the test suite, not just documented:
 
 1. **No forwarding loop.** The gateway refuses to start if the upstream resolves
-   to its own address or a legacy proxy port — that would be an infinite loop.
+   to its own address, or to a legacy proxy port unless
+   `ALLOW_LEGACY_UPSTREAM_PORT=1` explicitly claims that port (needed when a local
+   subscription bridge genuinely lives on 8080). Pointing at *itself* is always
+   fatal.
 2. **Fail open.** A missing, slow, broken or lying classifier means *keep the
    tools*. Dropping a needed schema is a hard failure; keeping an unneeded one
    just costs a few hundred tokens.
@@ -101,6 +128,101 @@ These are enforced by the test suite, not just documented:
    health payload to carry the gateway's own markers and to report the same
    `DATA_DIR`; anything else is surfaced as `foreign_service_on_port` rather
    than silently accepted as healthy.
+
+---
+
+## Supported providers
+
+Every row below is a first-class, tested path. "Free" means no second paid
+credential is introduced by the gateway.
+
+| Agent / host | Transport into the gateway | Profile & guide | Classifier mode |
+| --- | --- | --- | --- |
+| **Hermes Agent** | OpenAI `/v1/chat/completions` | `.env.hermes` · [guide](configs/hermes.md) | `upstream_reused` (free) |
+| **Google Antigravity** (Google One Pro) | OpenAI, via the local bridge on `:8080` | `.env.antigravity` · [guide](configs/antigravity.md) | `upstream_reused` (free) |
+| **Claude Code** | Anthropic `/v1/messages` (translated) | `.env.claude` · [guide](configs/claude_code.md) | `heuristics` (free) |
+| **Codex / GitHub Copilot bridge** | OpenAI, via a local bridge on `:4141` | `.env.codex` · [guide](configs/codex.md) | `heuristics` (free) |
+| **Aider / Cursor / generic OpenAI SDK, LangChain, CrewAI** | OpenAI | [guide](configs/generic_agent.md) | any |
+| **Ollama / vLLM / llama.cpp** | OpenAI | [guide](configs/generic_agent.md) | `local_ollama` (free) |
+| **OpenRouter / OpenAI direct** | OpenAI | `.env.openrouter` | `upstream_reused` or `external_jev` |
+
+Anything that speaks the OpenAI chat-completions API works without a guide. The
+Anthropic surface exists so Claude Code needs no shim.
+
+---
+
+## Zero-cost mode
+
+There are three ways to run the whole system for $0, and they compose:
+
+| Mode | Extra cost | Trade-off |
+| --- | --- | --- |
+| `CLASSIFIER_MODE=heuristics` | **none** — zero network calls | Only unambiguous turns are settled; ambiguous ones keep their tools |
+| `CLASSIFIER_MODE=upstream_reused` | **none beyond what you already pay** | Spends a few tokens of the subscription you're already using |
+| `CLASSIFIER_MODE=local_ollama` | **none** — stays on your machine | Needs a local model pulled (default `qwen2.5:0.5b`) |
+
+```bash
+# Cheapest of all: local rules, identical transport behaviour.
+CLASSIFIER_MODE=heuristics python -m src.gateway
+
+# Judge with the subscription you already have -- no second key.
+CLASSIFIER_MODE=upstream_reused CLASSIFIER_MODEL=gemini-2.5-flash \
+  python -m src.gateway
+
+# Judge locally; nothing leaves the machine.
+CLASSIFIER_MODE=local_ollama python -m src.gateway
+```
+
+**The bigger saving is orthogonal to the classifier.** Tool-schema pruning and
+artifact spillover happen on *every* turn regardless of mode, and they are what
+actually protects a subscription quota — a turn that sends no tool schema costs a
+fraction of one that does. On a quota-limited plan, `heuristics` plus pruning is
+strictly free, and no request ever leaves your machine to decide.
+
+### Antigravity example, end to end
+
+```bash
+python -m src.gateway --profile antigravity
+# listening on 127.0.0.1:8091 -> 127.0.0.1:8080 (Antigravity)
+# classifier: upstream_reused -> gemini-2.5-flash (same subscription)
+```
+
+Antigravity occupies `8080`, so the gateway takes `8091`. If you change that,
+do not reuse 8080 — the startup guard will (correctly) refuse to start.
+
+---
+
+## Profiles
+
+A profile is just `.env.<name>`. Nothing about `.env` changes: the flag decides
+which file is read, and a real environment variable still wins over both.
+
+| Profile | Port | Upstream | Classifier |
+| --- | --- | --- | --- |
+| `antigravity` | `8091` | Antigravity bridge `:8080` | `upstream_reused` · `gemini-2.5-flash` |
+| `claude` | `8091` | your OpenAI-compatible provider | `heuristics` |
+| `codex` | `8091` | Copilot bridge `:4141` | `heuristics` |
+| `hermes` | `8091` | your OpenAI-compatible provider | `upstream_reused` |
+| `openrouter` | `8090` | `https://openrouter.ai/api/v1` | `upstream_reused` |
+
+```bash
+python -m src.gateway --profile antigravity     # load .env.antigravity
+python -m src.gateway                           # fall back to .env
+python -m src.gateway --list-profiles           # discover what exists
+
+# The same switch, without the flag -- also honoured by
+# `uvicorn src.gateway:app` and by a sentinel-spawned gateway.
+AGENT_GATEWAY_PROFILE=claude python -m src.gateway
+```
+
+Unknown profile? The process exits `2` and lists what it found, rather than
+silently starting with the wrong upstream.
+
+**Switching profiles never moves your state.** `DATA_DIR`, `LOG_DIR` and
+`SHM_CACHE_DIR` are deliberately *not* set by any shipped profile, so the SQLite
+graph stays in WAL mode with its rows intact and every spilled artifact remains
+readable by its content-hash handle. That is asserted by the test suite, one test
+per profile file.
 
 ---
 
@@ -197,22 +319,46 @@ for the annotated template.
 | `UPSTREAM_API_KEY` | — | Falls back to `OPENAI_API_KEY`, `OPENROUTER_API_KEY` |
 | `GATEWAY_API_KEY` | unset | When set, clients must authenticate |
 
-### Classifier (optional)
+### Classifier modes
 
-Unset `CLASSIFIER_API_URL` to disable it entirely — routing then uses local
-heuristics only and fails open.
+`CLASSIFIER_MODE` selects where a routing verdict comes from. All four are
+first-class; none is required. The local heuristics always run first, and every
+mode fails open.
+
+| `CLASSIFIER_MODE` | Endpoint it uses | Credential | Extra cost |
+| --- | --- | --- | --- |
+| `heuristics` | *none — no network call at all* | — | **$0** |
+| `upstream_reused` | `UPSTREAM_BASE_URL/chat/completions` | borrowed from `UPSTREAM_API_KEY` | **$0** (same subscription) |
+| `local_ollama` | `OLLAMA_BASE_URL`, default `http://127.0.0.1:11434/v1` | none needed | **$0** (local) |
+| `external_jev` | `CLASSIFIER_API_URL` / `JEV_API_URL` | `CLASSIFIER_API_KEY`, or the name of another variable | whatever that endpoint bills |
+
+Leaving `CLASSIFIER_MODE` unset is `auto`, which preserves the original
+behaviour exactly: an explicitly configured URL *and* key means `external_jev`,
+otherwise `heuristics`. An unrecognised value degrades to `auto` rather than
+crashing; `/health` reports the effective mode so a typo is visible.
+
+`heuristics` blanks the endpoint outright, so no code path — and no future
+refactor — can reach out. The suite asserts this by poisoning the HTTP client and
+requiring the call to never happen.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CLASSIFIER_API_URL` | unset | OpenAI-compatible chat-completions URL |
-| `CLASSIFIER_MODEL` | `gpt-4o-mini` | Cheap, fast model |
+| `CLASSIFIER_MODE` | `auto` | `heuristics`, `upstream_reused`, `local_ollama`, `external_jev` |
+| `CLASSIFIER_API_URL` | unset | Dedicated endpoint (`external_jev`) |
+| `CLASSIFIER_MODEL` | mode-dependent | `gpt-4o-mini`, or `qwen2.5:0.5b` for `local_ollama` |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local runner for `local_ollama` |
 | `CLASSIFIER_API_KEY` / `CLASSIFIER_API_KEY_ENV` | — | Key, or the *name* of another variable holding it |
-| `CLASSIFIER_PROTOCOL` | `openai` | `openai` or `blueprint` |
+| `CLASSIFIER_PROTOCOL` | `openai` | `openai`, or `blueprint` (a `external_jev`-only shape) |
 | `CLASSIFIER_TIMEOUT_SECONDS` | `2.5` | Above this, fail open |
 | `CLASSIFIER_NEEDS_TOOLS_THRESHOLD` | `0.15` | Strip only below this confidence |
+| `CLASSIFIER_SUPERSEDE_THRESHOLD` | `0.75` | Confidence needed to overwrite a stored fact |
 
-`CLASSIFIER_API_KEY_ENV=UPSTREAM_API_KEY` reuses the upstream credential, so a
-secret never has to be duplicated into a second file.
+`upstream_reused` needs no credential of its own — that is the point. A local
+bridge that ignores auth still gets classification, because a missing bearer
+token does not silently disable the mode.
+
+`CLASSIFIER_API_KEY_ENV=UPSTREAM_API_KEY` reuses the upstream credential even in
+`external_jev`, so a secret never has to be duplicated into a second file.
 
 ### Behaviour tuning
 
@@ -224,6 +370,8 @@ secret never has to be duplicated into a second file.
 | `SNIFF_LIMIT_BYTES` | `512` | Escape look-ahead ceiling |
 | `ESCAPE_SCAN_CHARS` | `64` | Give up sniffing this early |
 | `REASONING_MODEL_REGEX` | unset | Extra comma-separated regex for models never to prune |
+| `ALLOW_LEGACY_UPSTREAM_PORT` | `0` | Allow an upstream on 8080/8090 (needed by local bridges). Never relaxes the self-forward guard |
+| `ANTHROPIC_THINKING_PASSTHROUGH` | `0` | Re-emit upstream reasoning as Anthropic `thinking` blocks (unsigned) |
 
 ### Migrating an existing deployment
 
@@ -238,8 +386,11 @@ Detailed, copy-pasteable guides live in [`configs/`](configs):
 
 | Agent | Guide | One-liner |
 | --- | --- | --- |
-| Claude Code | [`configs/claude_code.md`](configs/claude_code.md) | `export ANTHROPIC_BASE_URL=http://127.0.0.1:8090` |
+| Claude Code | [`configs/claude_code.md`](configs/claude_code.md) | `export ANTHROPIC_BASE_URL=http://127.0.0.1:8091` |
 | Aider | [`configs/aider.md`](configs/aider.md) | `aider --openai-api-base http://127.0.0.1:8090/v1` |
+| Google Antigravity | [`configs/antigravity.md`](configs/antigravity.md) | `python -m src.gateway --profile antigravity` |
+| Codex / Copilot bridge | [`configs/codex.md`](configs/codex.md) | `python -m src.gateway --profile codex` |
+| Hermes Agent | [`configs/hermes.md`](configs/hermes.md) | `python -m src.gateway --profile hermes` |
 | Generic / OpenAI SDK, LangChain, CrewAI | [`configs/generic_agent.md`](configs/generic_agent.md) | `base_url="http://127.0.0.1:8090/v1"` |
 
 ### Aider
@@ -272,12 +423,14 @@ upstream credential, so the agent never needs to know the real key.
    turn ──▶ tools? ──┼─ greeting / <25 chars ─▶ strip (send no schema at all)
                      ├─ action words / a path ─▶ keep
                      └─ ambiguous ────────────▶ classifier ─▶ keep | strip
-                                                     │
-                                        unavailable / bad reply ─▶ keep (fail open)
+                                                (mode-dependent)  │
+                                          unavailable / bad reply ─▶ keep (fail open)
 ```
 
 The classifier is only consulted for prompts the heuristics cannot resolve, and
-its answers are cached for five minutes.
+its answers are cached for five minutes. With `CLASSIFIER_MODE=heuristics` there
+is no network step at all: the ambiguous branch resolves straight to `keep`,
+which is why that mode is both free and impossible to break.
 
 ### Early-stream escape
 
@@ -339,13 +492,16 @@ pytest tests/ -v
 ```
 
 ```text
-180 passed
+224 passed
 ```
 
 The suite is **fully offline**: `tests/mock_upstream.py` provides both a real
 local HTTP server and an in-process `httpx.MockTransport`, so no API keys, no
-network and no spend. `tests/conftest.py` wires the fixtures together;
-`tests/test_sentinel.py` covers the watchdog. Coverage highlights:
+network and no spend. It also answers the gateway's *classifier* probes, which is
+how `upstream_reused` is proven over real HTTP. `tests/conftest.py` wires the
+fixtures together; `tests/test_sentinel.py` covers the watchdog;
+`tests/test_classifier_modes.py` covers the four modes and profiles. Coverage
+highlights:
 
 | Area | What is asserted |
 | --- | --- |
@@ -357,6 +513,9 @@ network and no spend. `tests/conftest.py` wires the fixtures together;
 | Memory lifecycle | Ebbinghaus curve, `N ≥ 3` graduation, conflict overwrite, compaction + `VACUUM` |
 | Anthropic bridge | Request/response/SSE translation, tool_use streaming, forced `tool_choice`, `count_tokens` |
 | Watchdog identity | A 200 from a *foreign* service on the port is rejected, so the sentinel cannot be fooled into reporting a dead gateway as healthy |
+| Classifier modes | `heuristics` provably makes **zero** network calls (HTTP client poisoned); `upstream_reused` routes over real HTTP carrying the upstream's own bearer token; `local_ollama` payload shape; `external_jev` blueprint probability |
+| Profiles | Every shipped profile loads, resolves a valid mode and cannot forward to itself; unknown profile exits `2`; **switching profiles leaves the WAL graph and the spilled artifacts byte-for-byte intact** |
+| Thinking blocks | Dropped by default; opt-in passthrough emits `thinking` before text, for `reasoning_content` / `reasoning` / `thinking` and part-lists |
 | Invariants | Loop guard, fail-open classification, unknown-field passthrough, no secret leakage in `/health` |
 
 ---
@@ -393,6 +552,14 @@ Documented rather than hidden:
   reports this as `foreign_service_on_port: true` and deliberately does *not*
   respawn, because a second process cannot win the bind either. Change
   `GATEWAY_PORT` to resolve it.
+- **Anthropic thinking blocks are opt-in and unsigned.** An OpenAI-shaped
+  upstream cannot supply the signature Anthropic expects, and a strict client
+  rejects an unsigned thinking block, so reasoning is dropped unless
+  `ANTHROPIC_THINKING_PASSTHROUGH=1` asks for it. Fabricating a signature is not
+  an option; dropping never breaks a stream.
+- **`ALLOW_LEGACY_UPSTREAM_PORT` is a heuristic waiver, not a safety switch.** It
+  permits an upstream on 8080/8090 so a local bridge can be used. It never
+  permits forwarding to the gateway's own address.
 - The SQLite graph is single-node. There is no multi-process coordination beyond
   WAL.
 

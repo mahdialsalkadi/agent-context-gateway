@@ -25,6 +25,7 @@ can run entirely offline against a mock upstream.
 from __future__ import annotations
 
 import json
+import argparse
 import os
 import sys
 import time
@@ -51,7 +52,12 @@ from .classifier import (
     inject_escape_instruction,
     strip_escape_instruction,
 )
-from .config import Settings, load_settings
+from .config import (
+    Settings,
+    available_profiles,
+    find_profile,
+    load_settings,
+)
 from .memory import GraphMemory, get_memory
 from .messages import last_user_text, normalize_messages, text_of
 
@@ -679,12 +685,21 @@ def create_app(
             try:
                 parsed = json.loads(payload)
             except Exception:
-                fallback = openai_to_anthropic_response({}, model)
+                fallback = openai_to_anthropic_response(
+                    {},
+                    model,
+                    cfg().anthropic_thinking_passthrough,
+                )
                 fallback["content"] = [
                     {"type": "text", "text": payload.decode("utf-8", "replace")}
                 ]
                 return JSONResponse(fallback, headers=headers)
-            return JSONResponse(openai_to_anthropic_response(parsed, model), headers=headers)
+            return JSONResponse(
+                openai_to_anthropic_response(
+                    parsed, model, cfg().anthropic_thinking_passthrough
+                ),
+                headers=headers,
+            )
 
         input_tokens = estimate_tokens(json.dumps(translated.get("messages", [])))
 
@@ -696,7 +711,11 @@ def create_app(
 
             try:
                 async for frame in translate_stream(
-                    upstream.aiter_raw(), model, input_tokens, observe
+                    upstream.aiter_raw(),
+                    model,
+                    input_tokens,
+                    observe,
+                    cfg().anthropic_thinking_passthrough,
                 ):
                     yield frame
             finally:
@@ -731,16 +750,76 @@ def assert_no_loop(settings: Settings) -> None:
 app = create_app()
 
 
-def main() -> int:
-    settings = load_settings()
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-context-gateway",
+        description=(
+            "Agent-agnostic OpenAI/Anthropic context gateway. With no arguments it "
+            "reads .env; with --profile it reads .env.<name>."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        default=os.environ.get("AGENT_GATEWAY_PROFILE", ""),
+        metavar="NAME",
+        help=(
+            "load the .env.NAME profile (e.g. --profile antigravity). "
+            "Falls back to .env when the flag is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="print the discoverable profile names and exit",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.list_profiles:
+        names = available_profiles()
+        if not names:
+            sys.stderr.write(
+                "[agent-context-gateway] no profiles found. Add a .env.<name> "
+                "file, or copy one of the shipped .env.* templates.\n"
+            )
+            return 1
+        for name in names:
+            print(name)
+        return 0
+
+    env_file = None
+    if args.profile:
+        env_file = find_profile(args.profile)
+        if env_file is None:
+            available = ", ".join(available_profiles()) or "none"
+            sys.stderr.write(
+                f"[FATAL] unknown profile {args.profile!r}. "
+                f"Looked for .env.{args.profile} in the working directory, the "
+                f"repository and ~/.agent-gateway. Available: {available}\n"
+            )
+            return 2
+        # Also exported, so a gateway respawned by the sentinel -- or started as
+        # `uvicorn src.gateway:app` -- resolves the same profile.
+        os.environ["AGENT_GATEWAY_PROFILE"] = args.profile
+
+    settings = load_settings(env_file=env_file)
     assert_no_loop(settings)
     settings.ensure_dirs()
+
+    # Built from the resolved settings, not the import-time module global, so
+    # `--profile` actually takes effect.
+    app = create_app(settings)
 
     import uvicorn
 
     sys.stderr.write(
         f"[agent-context-gateway] listening on http://{settings.label} -> {settings.upstream_base_url}\n"
     )
+    if settings.env_file:
+        sys.stderr.write(f"[agent-context-gateway] profile file: {settings.env_file}\n")
     if not settings.upstream_api_key:
         sys.stderr.write(
             "[agent-context-gateway] warning: no upstream API key set "
@@ -748,8 +827,15 @@ def main() -> int:
         )
     if not settings.classifier_enabled:
         sys.stderr.write(
-            "[agent-context-gateway] notice: classifier disabled; routing uses "
-            "local heuristics only and fails open.\n"
+            f"[agent-context-gateway] notice: classifier mode "
+            f"'{settings.effective_classifier_mode}' issues no network calls; "
+            f"routing uses local heuristics and fails open.\n"
+        )
+    else:
+        sys.stderr.write(
+            f"[agent-context-gateway] classifier mode "
+            f"'{settings.effective_classifier_mode}' -> "
+            f"{settings.classifier_api_url} ({settings.classifier_model})\n"
         )
     uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
     return 0
