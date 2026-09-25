@@ -194,6 +194,10 @@ INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
 # statement about which tool category the turn belongs to.
 INTENT_BOOST = 5.0
 
+# The blueprint's name for the same table, kept as an alias so both names in the
+# docs (`INTENT_KEYWORDS`, `ARABIC_INTENT_MAP`) resolve to one source of truth.
+ARABIC_INTENT_MAP = INTENT_KEYWORDS
+
 
 def intent_boosts(prompt: str) -> Dict[str, float]:
     """Per-tool score boosts for intent the BM25 tokenizer cannot see.
@@ -852,6 +856,7 @@ def get_classifier(settings: Optional[Settings] = None) -> Classifier:
 
 __all__ = [
     "ALWAYS_KEEP_TOOLS",
+    "ARABIC_INTENT_MAP",
     "CORE_TOOLS",
     "INTENT_BOOST",
     "INTENT_KEYWORDS",

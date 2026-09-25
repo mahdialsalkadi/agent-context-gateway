@@ -14,7 +14,9 @@ import time
 
 from src.classifier import (
     ALWAYS_KEEP_TOOLS,
+    ARABIC_INTENT_MAP,
     CORE_TOOLS,
+    INTENT_KEYWORDS,
     intent_boosts,
     rank_tools,
 )
@@ -379,6 +381,20 @@ def test_hard_cap_keeps_bash_and_read_file_for_arabic_within_the_limit():
     assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
     assert "bash" in kept
     assert "read_file" in kept
+
+
+def test_arabic_intent_map_alias_shares_one_source_of_truth():
+    assert ARABIC_INTENT_MAP is INTENT_KEYWORDS
+    assert "شغل" in ARABIC_INTENT_MAP["bash"]
+    assert "افحص" in ARABIC_INTENT_MAP["read_file"]
+
+
+def test_mission_arabic_prompt_caps_a_49_tool_catalog():
+    """The blueprint's headline case: 49 tools in, core trio out."""
+    kept = names(rank_tools("افحص الملف وشغل التيست", big_toolset(49), 5, hard_cap=True))
+
+    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
+    assert {"bash", "read_file", "fetch_log"}.issubset(set(kept))
 
 
 def test_hard_cap_shrinks_a_prompt_with_no_english_overlap():
