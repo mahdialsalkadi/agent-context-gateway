@@ -56,7 +56,7 @@ cmake -B build -DGGML_VULKAN=ON && cmake --build build --config Release
 `-ngl 99` offloads all layers to VRAM through Vulkan:
 
 ```bash
-llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q4_K_M \
+llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q8_0 \
   --port 11435 \
   -ngl 99 \
   -c 2048 \
@@ -70,8 +70,16 @@ llama_prepare_model_devices: using device Vulkan0 (AMD BC-250 (RADV GFX1013))
 load_tensors: offloading output layer to GPU
 load_tensors: offloading 24 repeating layers to GPU
 load_tensors: offloaded 26/26 layers to GPU
-load_tensors:      Vulkan0 model buffer size =  1240.92 MiB
+load_tensors:      Vulkan0 model buffer size =  1970.02 MiB
 ```
+
+Available quants on the same repo:
+
+| Quant | VRAM (Vulkan0 buffer) | Notes |
+| --- | --- | --- |
+| `Q8_0` | ~1970 MiB | default here; sharpest separation between A and B |
+| `Q4_K_M` | ~1241 MiB | smaller/faster, slightly softer probabilities |
+| `BF16` | ~4 GB | full precision, rarely needed for a binary decision |
 
 ## 3. Point the gateway at it
 

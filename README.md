@@ -239,9 +239,11 @@ llama-server --list-devices
 
 ```bash
 # Terminal 1 -- serve the decision model on port 11435, fully on the GPU.
-llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q4_K_M \
+llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q8_0 \
   --port 11435 -ngl 99 -c 2048 --threads 4
 # Startup should log: "offloaded 26/26 layers to GPU" and a Vulkan0 buffer size.
+# Q8_0 needs ~2 GB VRAM and gives sharper verdicts; Q4_K_M (~1.2 GB) is the
+# lighter option with slightly softer probabilities.
 
 # Terminal 2 -- run the gateway against it.
 agent-gateway start --profile local_jev
