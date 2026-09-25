@@ -77,9 +77,22 @@ Available quants on the same repo:
 
 | Quant | VRAM (Vulkan0 buffer) | Notes |
 | --- | --- | --- |
-| `Q8_0` | ~1970 MiB | default here; sharpest separation between A and B |
-| `Q4_K_M` | ~1241 MiB | smaller/faster, slightly softer probabilities |
+| `Q8_0` | ~1970 MiB | default here; best-calibrated at the shipped threshold |
+| `Q4_K_M` | ~1241 MiB | smaller; needs a higher threshold to avoid false positives |
 | `BF16` | ~4 GB | full precision, rarely needed for a binary decision |
+
+**Measured** on a Radeon BC-250 (RADV, `-ngl 99`), 22 labeled prompts at the
+shipped `CLASSIFIER_NEEDS_TOOLS_THRESHOLD=0.15`:
+
+| Quant | Accuracy @0.15 | Best threshold | Median verdict | VRAM |
+| --- | --- | --- | --- | --- |
+| `Q8_0` | **22/22 (100%)** | 0.16 → 100% | 400 ms | 1970 MiB |
+| `Q4_K_M` | 15/22 (68%) | 0.24 → 95% | 391 ms | 1241 MiB |
+
+Speed is a wash (~2%, within run-to-run noise). Q4_K_M's error mode is false
+positives: its *no-tool* probabilities cluster at 0.16–0.40, just over the
+0.15 cut, so it keeps tool schemas it does not need. Re-tuning to ~0.24 recovers
+most of it but still trails Q8_0 — which is why `Q8_0` is the default.
 
 ## 3. Point the gateway at it
 
