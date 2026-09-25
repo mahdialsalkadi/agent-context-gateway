@@ -131,19 +131,41 @@ def escape_stream(follow_up: str = " I need the terminal to do that.") -> List[b
     ]
 
 
-def plan_for(messages: Sequence[Dict[str, Any]], tools: Optional[list] = None) -> Dict[str, Any]:
-    """Pick a behaviour from the latest user turn."""
-    prompt = ""
+def _latest_user_text(messages: Sequence[Dict[str, Any]]) -> str:
     for message in reversed(list(messages or [])):
         if isinstance(message, dict) and message.get("role") == "user":
             content = message.get("content")
             if isinstance(content, str):
-                prompt = content
-            elif isinstance(content, list):
-                prompt = " ".join(
+                return content
+            if isinstance(content, list):
+                return " ".join(
                     str(part.get("text", "")) for part in content if isinstance(part, dict)
                 )
-            break
+    return ""
+
+
+def is_classifier_request(messages: Sequence[Dict[str, Any]]) -> bool:
+    """Detect the gateway's own classifier probe (see src/classifier.py)."""
+    for message in messages or []:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str) and "binary classifier" in content.lower():
+                return True
+    return False
+
+
+def plan_for(messages: Sequence[Dict[str, Any]], tools: Optional[list] = None) -> Dict[str, Any]:
+    """Pick a behaviour from the latest user turn.
+
+    This mock doubles as a classifier endpoint, so a single process can back the
+    gateway's `CLASSIFIER_API_URL` as well as its upstream. A prompt containing
+    ``force_escape`` is classified as "no tools needed", which makes the whole
+    prune -> escape -> replay path reachable from a plain curl command.
+    """
+    prompt = _latest_user_text(messages)
+
+    if is_classifier_request(messages):
+        return {"kind": "classifier", "verdict": "force_escape" not in prompt.lower()}
 
     lowered = prompt.lower()
     has_tools = bool(tools)
@@ -306,6 +328,28 @@ def make_handler(state: MockState):
             plan = plan_for(body.get("messages") or [], body.get("tools"))
             model = str(body.get("model") or "mock-model")
 
+            if plan["kind"] == "classifier":
+                self._send_json(
+                    200,
+                    {
+                        "id": "chatcmpl-mock-classifier",
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": json.dumps({"needs_tools": plan["verdict"]}),
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+                    },
+                )
+                return
+
             if plan["kind"] == "error":
                 self._send_json(
                     plan["status"],
@@ -384,6 +428,27 @@ def scripted_handler(frames: Sequence[bytes]) -> Any:
 
         payload = json.loads(request.content) if request.content else {}
         plan = plan_for(payload.get("messages") or [], payload.get("tools"))
+        if plan["kind"] == "classifier":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-mock-classifier",
+                    "object": "chat.completion",
+                    "model": payload.get("model", "mock-model"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps({"needs_tools": plan["verdict"]}),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 9, "completion_tokens": 3},
+                },
+                request=request,
+            )
         if plan["kind"] == "error":
             return httpx.Response(500, json={"error": {"message": "mock failure"}}, request=request)
         if not payload.get("stream"):

@@ -399,22 +399,43 @@ async def decide_route(
 # Process-wide classifier
 # ------------------------------------------------------------------------------
 _CLASSIFIER: Optional[Classifier] = None
+_CLASSIFIER_KEY: Optional[tuple] = None
+
+
+def _classifier_key(settings: Settings) -> tuple:
+    return (
+        settings.classifier_api_url,
+        settings.classifier_api_key,
+        settings.classifier_model,
+        settings.classifier_protocol,
+        settings.classifier_timeout,
+        settings.classifier_needs_tools_threshold,
+        settings.classifier_supersede_threshold,
+    )
 
 
 def configure(classifier: Classifier) -> Classifier:
-    global _CLASSIFIER
+    global _CLASSIFIER, _CLASSIFIER_KEY
     _CLASSIFIER = classifier
+    _CLASSIFIER_KEY = _classifier_key(classifier.settings)
     return classifier
 
 
 def get_classifier(settings: Optional[Settings] = None) -> Classifier:
-    global _CLASSIFIER
-    if _CLASSIFIER is None:
-        if settings is None:
-            from .config import load_settings
+    """Return the process-wide classifier, rebuilding it if the config changed.
 
-            settings = load_settings()
+    Keyed on the classifier-relevant settings: a cached instance built from a
+    different configuration would silently route with the wrong policy.
+    """
+    global _CLASSIFIER, _CLASSIFIER_KEY
+    if settings is None:
+        from .config import load_settings
+
+        settings = load_settings()
+    key = _classifier_key(settings)
+    if _CLASSIFIER is None or _CLASSIFIER_KEY != key:
         _CLASSIFIER = Classifier(settings)
+        _CLASSIFIER_KEY = key
     return _CLASSIFIER
 
 

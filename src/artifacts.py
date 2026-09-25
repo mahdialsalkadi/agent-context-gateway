@@ -293,23 +293,25 @@ def summarize(raw: str, handle: str) -> str:
 # Process-wide store
 # ------------------------------------------------------------------------------
 _STORE: Optional[ArtifactStore] = None
+_STORE_KEY: Optional[tuple] = None
 
 
 def configure(store: ArtifactStore) -> ArtifactStore:
-    global _STORE
+    global _STORE, _STORE_KEY
     _STORE = store
+    _STORE_KEY = (str(store.cache_dir), store.truncate_threshold_chars)
     return store
 
 
 def get_store(settings: Optional[Any] = None) -> ArtifactStore:
-    """Lazily build the process-wide store."""
-    global _STORE
-    if _STORE is None:
-        if settings is None:
-            from .config import load_settings
+    """Return the process-wide store, rebuilding it if the config changed."""
+    global _STORE, _STORE_KEY
+    if settings is None:
+        from .config import load_settings
 
-            settings = load_settings()
-        _STORE = ArtifactStore(
-            settings.shm_cache_dir, settings.truncate_threshold_chars
-        )
+        settings = load_settings()
+    key = (str(settings.shm_cache_dir), settings.truncate_threshold_chars)
+    if _STORE is None or _STORE_KEY != key:
+        _STORE = ArtifactStore(settings.shm_cache_dir, settings.truncate_threshold_chars)
+        _STORE_KEY = key
     return _STORE

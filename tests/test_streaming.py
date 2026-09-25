@@ -661,6 +661,37 @@ async def test_anthropic_route_never_prunes_a_forced_tool_choice(api, mock_state
     assert "tools" in mock_state.bodies[0]
 
 
+async def test_classifier_over_real_http_prunes_then_escapes(settings, store, memory, mock_state):
+    """Full path over real HTTP: classifier says strip, model escapes, replay.
+
+    The mock upstream doubles as a classifier endpoint, so this exercises the
+    whole chain without a stub.
+    """
+    tuned = replace(
+        settings,
+        classifier_api_url=f"{settings.upstream_base_url}/chat/completions",
+        classifier_api_key="test",
+    )
+    app = create_app(settings=tuned, store=store, memory=memory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gw", timeout=30.0
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions", json=openai_body("force_escape please")
+        )
+
+    assert "EarlyEscapeAbort" in response.headers["x-proxy-route"]
+    assert response.headers["x-proxy-tool-action"] == "Reverted-To-Full"
+
+    # First real upstream call is the pruned attempt; the last one is the replay.
+    upstream = [
+        body for body in mock_state.bodies if body.get("stream") is not None
+    ]
+    assert "tools" not in upstream[0]
+    assert "tools" in upstream[-1]
+
+
 async def test_anthropic_model_override_is_applied(settings, store, memory, mock_state):
     """Claude Code sends `claude-*` ids; a plain OpenAI upstream needs a mapping."""
     tuned = replace(settings, anthropic_model_override="gpt-4o-mini")

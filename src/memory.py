@@ -537,22 +537,27 @@ class GraphMemory:
 # Process-wide memory
 # ------------------------------------------------------------------------------
 _MEMORY: Optional[GraphMemory] = None
+_MEMORY_KEY: Optional[str] = None
 
 
 def configure(memory: GraphMemory) -> GraphMemory:
-    global _MEMORY
+    global _MEMORY, _MEMORY_KEY
     _MEMORY = memory
+    _MEMORY_KEY = str(memory.db_path)
     return memory
 
 
 def get_memory(settings: Optional[Any] = None) -> GraphMemory:
-    global _MEMORY
-    if _MEMORY is None:
-        if settings is None:
-            from .config import load_settings
+    """Return the process-wide graph, rebuilding it if the database changed."""
+    global _MEMORY, _MEMORY_KEY
+    if settings is None:
+        from .config import load_settings
 
-            settings = load_settings()
+        settings = load_settings()
+    key = str(settings.db_path)
+    if _MEMORY is None or _MEMORY_KEY != key:
         _MEMORY = GraphMemory(settings.db_path)
+        _MEMORY_KEY = key
         try:
             _MEMORY.init_schema()
         except Exception:
