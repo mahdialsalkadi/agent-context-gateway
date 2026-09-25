@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import argparse
 import os
+import socket
 import sys
 import time
 import uuid
@@ -34,10 +35,17 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import __version__
 from .artifacts import FETCH_LOG_TOOL, ArtifactStore, get_store
+from .dashboard import (
+    dashboard_response,
+    memory_relations,
+    forget_relation,
+    profile_payload,
+    stats_payload,
+)
 from .bridge import (
     anthropic_to_openai_request,
     estimate_tokens,
@@ -808,6 +816,80 @@ def create_app(
             },
         )
 
+    # ----------------------------------------------------------------------
+    # Embedded web dashboard (GET /ui + its JSON endpoints)
+    # ----------------------------------------------------------------------
+    @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
+    async def dashboard():
+        return dashboard_response()
+
+    @app.get("/ui/api/stats", include_in_schema=False)
+    async def dashboard_stats():
+        from .analytics import Analytics
+
+        return JSONResponse(stats_payload(Analytics(cfg().audit_log_path)))
+
+    @app.get("/ui/api/profile", include_in_schema=False)
+    async def dashboard_profile():
+        from .config import available_profiles
+
+        return JSONResponse(
+            profile_payload(
+                available_profiles(),
+                os.environ.get("AGENT_GATEWAY_PROFILE") or ".env",
+            )
+        )
+
+    @app.post("/ui/api/profile", include_in_schema=False)
+    async def dashboard_switch_profile(request: Request):
+        from .config import available_profiles, find_profile
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        name = str((body or {}).get("profile") or "").strip()
+        if not name:
+            return JSONResponse({"error": "profile name required"}, status_code=400)
+        if find_profile(name) is None:
+            return JSONResponse(
+                {"error": f"profile {name!r} does not exist"}, status_code=404
+            )
+
+        # Exported for the next process, and applied live via the app-state
+        # singletons: they rebuild from the new settings on the next request.
+        os.environ["AGENT_GATEWAY_PROFILE"] = name
+        reloaded = load_settings(env_file=find_profile(name))
+        app.state.settings = reloaded
+        app.state.classifier = None
+        app.state.memory = None
+        app.state.store = None
+        return JSONResponse(
+            {
+                "message": (
+                    f"switched to {name}: upstream {reloaded.upstream_base_url}, "
+                    f"classifier {reloaded.effective_classifier_mode}. "
+                    f"Note: the listen port ({reloaded.port}) applies on restart."
+                )
+            }
+        )
+
+    @app.get("/ui/api/memory", include_in_schema=False)
+    async def dashboard_memory():
+        return JSONResponse({"relations": memory_relations(graph())})
+
+    @app.delete("/ui/api/memory", include_in_schema=False)
+    async def dashboard_forget(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        relation_id = (body or {}).get("id")
+        deleted = forget_relation(graph(), relation_id)
+        if not deleted:
+            return JSONResponse({"error": "no such relation"}, status_code=404)
+        return JSONResponse({"deleted": relation_id})
+
     return app
 
 
@@ -912,6 +994,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"'{settings.effective_classifier_mode}' -> "
             f"{settings.classifier_api_url} ({settings.classifier_model})\n"
         )
+    # Pre-flight bind check. Uvicorn catches the bind OSError itself, logs a
+    # terse line and exits with code 3 -- the user never gets a traceback, but
+    # they also never get told what to do about it. Probing the port here lets
+    # us say exactly that, with the fix.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((settings.host, settings.port))
+    except OSError:
+        sys.stderr.write(
+            f"\n[ERROR] Port {settings.port} is in use by another application.\n"
+            f"  Start elsewhere:  python -m src.gateway --port {settings.port + 1}\n"
+            f"  See who owns it:  ss -ltnp | grep :{settings.port}\n"
+            f"  Full diagnosis:   agent-gateway doctor\n"
+        )
+        return 1
+    finally:
+        probe.close()
+
     uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
     return 0
 

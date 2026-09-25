@@ -426,7 +426,9 @@ def test_each_shipped_profile_loads_and_has_a_valid_mode(name, clean_env):
     assert settings.is_loop_upstream() is False, f"{name} would forward to itself"
 
 
-def test_antigravity_profile_relaxes_the_legacy_port_and_reuses_gemini():
+def test_antigravity_profile_relaxes_the_legacy_port_and_reuses_gemini(clean_env):
+    # clean_env: load_env_file writes into os.environ, and without the fixture
+    # this test leaks CLASSIFIER_MODE=upstream_reused into every later test.
     settings = load_settings(env_file=find_profile("antigravity"))
 
     assert settings.port == 8091, "must not collide with Antigravity on 8080"

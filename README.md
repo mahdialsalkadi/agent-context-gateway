@@ -21,6 +21,19 @@ own machine — no second provider, no second key. See
 [Zero-cost mode](#zero-cost-mode).
 
 ```bash
+pip install -e .
+agent-gateway init        # 60-second interactive setup, writes .env for you
+agent-gateway run claude  # starts the gateway AND Claude Code, wired together
+```
+
+That is the whole quickstart. `init` asks which agent you use and what your
+upstream is, detects local servers already running (Antigravity on 8080, Ollama
+on 11434), and writes the `.env`; `run` launches the gateway in the background
+and drops you into your agent with the right environment variables injected.
+
+Prefer the explicit route:
+
+```bash
 cp .env.example .env      # set UPSTREAM_BASE_URL + UPSTREAM_API_KEY
 pip install -r requirements.txt
 python -m src.gateway
@@ -60,6 +73,9 @@ No `--profile` flag means `.env`, exactly as before.
 - [Testing](#testing)
 - [Security](#security)
 - [Limitations](#limitations)
+
+> New here? `agent-gateway init` then `agent-gateway run claude`. That is the
+> whole setup — see [Quickstart](#quickstart).
 
 ---
 
@@ -507,17 +523,67 @@ agent-gateway stats --json     # for your own dashboards
 ```bash
 pip install -e .               # puts `agent-gateway` on your PATH
 
+agent-gateway init             # interactive setup wizard -> writes .env
+agent-gateway run claude       # gateway (auto-started) + agent in one command
 agent-gateway start [--profile NAME] [--port N] [--daemon]
 agent-gateway stop              # stops what this CLI started; never guesses PIDs
 agent-gateway status            # pid, health, mode, profile, foreign-service flag
+agent-gateway doctor            # 6-point diagnosis with copy-paste fixes
 agent-gateway stats [--live|--json]
+agent-gateway ui                # open the browser dashboard
 agent-gateway test              # the offline suite, no keys needed
 agent-gateway service install   # systemd user unit, written AND enabled
 ```
 
+`agent-gateway run` knows how to wire Claude Code (`ANTHROPIC_BASE_URL`), Hermes
+(`OPENAI_BASE_URL`) and Aider (`--openai-api-base`), starts the gateway first if
+it is not already running, and passes any extra arguments through to the agent.
+
 `agent-gateway stop` only ever signals a PID it recorded itself; if something
 else answers on the port it says so and exits non-zero rather than killing an
 innocent process.
+
+### `agent-gateway doctor`
+
+Two seconds to find out why anything is misbehaving, with fixes you can paste:
+
+```text
+agent-gateway doctor
+==============================================
+[ OK ] gateway         healthy on :8091 (v0.1.0)
+[ OK ] upstream        reachable in 12ms
+[ OK ] classifier      heuristics -- no network call, fails open
+[ OK ] database        WAL ok, 3 tables
+[ OK ] shared memory   /tmp/uxdemo/shm writable, 3302MB free
+[ OK ] agent binaries  installed: aider, docker, hermes
+==============================================
+0 failed, 0 warnings, 6 checks
+```
+
+A failure looks like this, colour-coded in a real terminal:
+
+```text
+[FAIL] gateway         something else answers on :8090 (foreign service)
+       fix: Start on a free port: agent-gateway start --port 8091
+```
+
+`--json` gives the same report for scripts. Predicted operational errors (port
+in use, unknown agent, missing binary, unknown profile) print a human message
+and hints — never a traceback. Unexpected bugs still traceback on purpose.
+
+### Web dashboard
+
+`agent-gateway ui` (or just visiting `http://127.0.0.1:<port>/ui`) opens a
+single-page dashboard served by the gateway itself — one HTML file, vanilla JS,
+Tailwind from CDN, no Node, no build step:
+
+- live token and dollar savings meters (the same estimates `stats` shows)
+- the last 20 requests with route badges, tool counts and latency
+- one-click profile switching (nothing is lost: storage dirs are shared)
+- the knowledge graph with a `forget` button per relation
+
+It polls `/ui/api/*` every 3 seconds and marks itself `offline` if the gateway
+disappears, so it never silently shows stale numbers.
 
 ### Early-stream escape
 
@@ -579,7 +645,7 @@ pytest tests/ -v
 ```
 
 ```text
-290 passed
+332 passed
 ```
 
 The suite is **fully offline**: `tests/mock_upstream.py` provides both a real
@@ -609,6 +675,8 @@ highlights:
 | Analytics | Synthetic audit rows in, savings and percentiles out; torn lines skipped; legacy rows estimated |
 | CLI | pidfile lifecycle against a really-spawned daemon; `stop` refuses to signal a PID it did not record; service unit generation |
 | Memory retrieval | Typos and prefixes forgiven, unrelated words not; budget packing never splits a fact; audit hook writes one row per retrieval |
+| UX layer | `init` presets load through the real settings path; `doctor` flags a foreign port-holder as FAIL with a fix; `run` injects the right env per agent; predicted errors render as guidance, never tracebacks — while genuine bugs still traceback |
+| Web dashboard | `/ui` serves self-contained HTML; stats/profile/memory JSON endpoints work against the real app; live profile switch applies without restart; forget deletes exactly one relation |
 | Invariants | Loop guard, fail-open classification, unknown-field passthrough, no secret leakage in `/health` |
 
 ---
