@@ -226,11 +226,22 @@ A purpose-built decision model —
 — served by `llama-server`. It answers a single letter per request, which the
 gateway reads from the token **log probabilities** (`max_tokens=1`,
 `logprobs=true`, `top_logprobs=10`) and turns into `P(A) = e^a / (e^a + e^b)`.
-One forward pass, roughly 15ms, entirely offline.
+One forward pass, entirely offline.
+
+Offload every layer to the GPU via **Vulkan** with `-ngl 99`. Confirm the build
+sees a device first:
 
 ```bash
-# Terminal 1 -- serve the decision model on port 11435.
-llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q4_K_M --port 11435
+llama-server --list-devices
+# Available devices:
+#   Vulkan0: AMD BC-250 (RADV GFX1013) (15849 MiB, 14784 MiB free)
+```
+
+```bash
+# Terminal 1 -- serve the decision model on port 11435, fully on the GPU.
+llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q4_K_M \
+  --port 11435 -ngl 99 -c 2048 --threads 4
+# Startup should log: "offloaded 26/26 layers to GPU" and a Vulkan0 buffer size.
 
 # Terminal 2 -- run the gateway against it.
 agent-gateway start --profile local_jev
@@ -238,12 +249,28 @@ agent-gateway start --profile local_jev
 agent-gateway        # question 2 -> "Local Jev-Style Qwen3.5-2B GGUF"
 ```
 
+If `--list-devices` reports no Vulkan device, install the userspace driver:
+
+```bash
+# Debian / Ubuntu
+sudo apt install vulkan-tools mesa-vulkan-drivers
+# Arch
+sudo pacman -S vulkan-icd-loader mesa-vulkan-drivers    # or vulkan-intel / vulkan-radeon
+# Verify
+vulkaninfo --summary
+```
+
+If `llama-server` still cannot see the GPU, it was built without Vulkan —
+rebuild with `cmake -DGGML_VULKAN=ON ..`.
+
 The endpoint is overridable with `LOCAL_JEV_URL` (default
-`http://127.0.0.1:11435/v1/chat/completions`). A decision that does not arrive
-within 400ms fails open to the local heuristics: the tools are kept, and no
-request is ever delayed by a slow classifier. The same single-pass protocol also
-answers the memory conflict question (*"does the new value supersede the existing
-value?"*), so relation updates stay consistent in `local_jev` mode.
+`http://127.0.0.1:11435/v1/chat/completions`) and the verdict budget with
+`LOCAL_JEV_TIMEOUT_SECONDS` (default `0.4`). A decision that does not arrive in
+budget fails open to the local heuristics: the tools are kept and no request is
+ever delayed by a slow classifier. GPU offload clears 0.4s easily on a discrete
+gpu; you can raise it on a busy integrated one. The same single-pass protocol
+also answers the memory conflict question (*"does the new value supersede the
+existing value?"*), so relation updates stay consistent in `local_jev` mode.
 
 ---
 
@@ -404,6 +431,7 @@ requiring the call to never happen.
 | `CLASSIFIER_MODEL` | mode-dependent | `gpt-4o-mini`, `qwen2.5:0.5b` for `local_ollama`, `jev-style-qwen3.5-2b` for `local_jev` |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local runner for `local_ollama` |
 | `LOCAL_JEV_URL` | `http://127.0.0.1:11435/v1/chat/completions` | `llama-server` endpoint for `local_jev` |
+| `LOCAL_JEV_TIMEOUT_SECONDS` | `0.4` | Verdict budget for `local_jev` before failing open |
 | `CLASSIFIER_API_KEY` / `CLASSIFIER_API_KEY_ENV` | — | Key, or the *name* of another variable holding it |
 | `CLASSIFIER_PROTOCOL` | `openai` | `openai`, or `blueprint` (a `external_jev`-only shape) |
 | `CLASSIFIER_TIMEOUT_SECONDS` | `2.5` | Above this, fail open |

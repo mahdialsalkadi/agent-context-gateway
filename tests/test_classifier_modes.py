@@ -705,3 +705,47 @@ async def test_local_jev_resolves_memory_conflicts_with_the_supersede_question(m
 
     assert await classifier.value_supersedes("billing", "uses", "postgres", "mysql") is False
     assert "supersede" in seen["prompt"].lower()
+
+
+def test_local_jev_timeout_defaults_to_0_4_and_is_configurable():
+    default = load_settings(env={"CLASSIFIER_MODE": "local_jev"})
+    assert default.local_jev_timeout == 0.4
+
+    tuned = load_settings(
+        env={"CLASSIFIER_MODE": "local_jev", "LOCAL_JEV_TIMEOUT_SECONDS": "1.5"}
+    )
+    assert tuned.local_jev_timeout == 1.5
+
+
+async def test_local_jev_uses_the_configured_timeout(monkeypatch):
+    settings = load_settings(
+        env={"CLASSIFIER_MODE": "local_jev", "LOCAL_JEV_TIMEOUT_SECONDS": "1.5"}
+    )
+    classifier = Classifier(settings)
+    seen = {}
+
+    async def fake_post(url, payload, timeout=None):
+        seen["timeout"] = timeout
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {
+                                "token": "A",
+                                "logprob": -0.01,
+                                "top_logprobs": [
+                                    {"token": "A", "logprob": -0.01},
+                                    {"token": "B", "logprob": -5.0},
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(classifier, "_post", fake_post)
+
+    assert await classifier.needs_tools("run the test suite") is True
+    assert seen["timeout"] == 1.5

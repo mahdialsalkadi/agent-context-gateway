@@ -102,8 +102,9 @@ JEV_NEEDS_TOOLS_QUESTION = (
 )
 JEV_SUPERSEDE_QUESTION = "Does the new value supersede the existing value?"
 
-# A 2B local model exists to be fast. If llama-server cannot answer within this
-# budget the turn fails open to the local heuristics rather than stalling.
+# Default verdict budget for the local GGUF. A GPU-offloaded server (`-ngl 99`)
+# clears this easily; it stays tunable with LOCAL_JEV_TIMEOUT_SECONDS so a
+# CPU-only host can wait longer before failing open to the local heuristics.
 LOCAL_JEV_TIMEOUT_SECONDS = 0.4
 
 
@@ -660,11 +661,15 @@ class Classifier:
             if threshold is None
             else threshold
         )
+        budget = float(
+            getattr(self.settings, "local_jev_timeout", None)
+            or LOCAL_JEV_TIMEOUT_SECONDS
+        )
         try:
             data = await self._post(
                 self.settings.classifier_api_url,
                 self._build_jev_payload(prompt, question),
-                LOCAL_JEV_TIMEOUT_SECONDS,
+                budget,
             )
         except Exception:
             return None

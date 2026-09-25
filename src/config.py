@@ -61,6 +61,10 @@ DEFAULT_OLLAMA_CLASSIFIER_MODEL = "qwen2.5:0.5b"
 # request, so a verdict is a single forward pass and needs no API key.
 DEFAULT_LOCAL_JEV_URL = "http://127.0.0.1:11435/v1/chat/completions"
 DEFAULT_LOCAL_JEV_MODEL = "jev-style-qwen3.5-2b"
+# Verdict budget for the local GGUF. A GPU-offloaded server (`-ngl 99`) is fast
+# enough that 0.4s is generous; a CPU-only host can raise it, at the cost of
+# waiting longer before falling back to the local heuristics.
+DEFAULT_LOCAL_JEV_TIMEOUT = 0.4
 
 DEFAULT_TRUNCATE_CHARS = 800
 DEFAULT_SNIFF_LIMIT = 512
@@ -266,6 +270,8 @@ class Settings:
     # Endpoint of the local llama-server hosting the Jev decision GGUF. Only
     # consulted by `local_jev`; overridable with LOCAL_JEV_URL.
     local_jev_url: str = DEFAULT_LOCAL_JEV_URL
+    # Seconds to wait for a single-pass verdict before failing open.
+    local_jev_timeout: float = DEFAULT_LOCAL_JEV_TIMEOUT
     # `auto` derives the mode from what is configured, so an existing deployment
     # keeps working without setting CLASSIFIER_MODE at all.
     classifier_mode: str = CLASSIFIER_MODE_AUTO
@@ -551,6 +557,10 @@ def load_settings(
         ),
         local_jev_url=sanitize_url(
             _first(env, ("LOCAL_JEV_URL",), DEFAULT_LOCAL_JEV_URL)
+        ),
+        local_jev_timeout=_as_float(
+            _first(env, ("LOCAL_JEV_TIMEOUT_SECONDS",), ""),
+            DEFAULT_LOCAL_JEV_TIMEOUT,
         ),
         anthropic_model_override=_first(
             env, ("ANTHROPIC_MODEL_OVERRIDE", "BRIDGE_MODEL_OVERRIDE"), ""
