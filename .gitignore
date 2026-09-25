@@ -8,6 +8,7 @@
 !.env.claude
 !.env.codex
 !.env.hermes
+!.env.local_jev
 !.env.openrouter
 *.pem
 *.key

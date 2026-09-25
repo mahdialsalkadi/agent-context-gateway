@@ -8,8 +8,23 @@ without spending a cent or needing credentials.
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
+
 import httpx
 import pytest
+
+# --- hermetic HOME -----------------------------------------------------------
+# `src.gateway` resolves settings at import time, and `load_env_file` only fills
+# in defaults. A developer's real `~/.agent-gateway/.env` (or an installed
+# wrapper) would therefore leak into every test and silently override the
+# shipped profile files. Point HOME at a scratch directory before importing any
+# project module, then restore it when the session ends.
+_TEST_HOME = tempfile.mkdtemp(prefix="agent-gateway-test-home-")
+_ORIGINAL_HOME = os.environ.get("HOME")
+os.environ["HOME"] = _TEST_HOME
+os.environ["USERPROFILE"] = _TEST_HOME
 
 from src.artifacts import ArtifactStore
 from src.classifier import Classifier
@@ -17,6 +32,15 @@ from src.config import Settings
 from src.gateway import create_app
 from src.memory import GraphMemory
 from tests.mock_upstream import MockState, start_mock_upstream
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolated_home():
+    """Restore the caller's HOME and bin the scratch directory after the run."""
+    yield
+    if _ORIGINAL_HOME is not None:
+        os.environ["HOME"] = _ORIGINAL_HOME
+    shutil.rmtree(_TEST_HOME, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

@@ -34,17 +34,19 @@ DEFAULT_CLASSIFIER_MODEL = "gpt-4o-mini"
 # ------------------------------------------------------------------------------
 # Classifier routing modes
 # ------------------------------------------------------------------------------
-# `CLASSIFIER_MODE` selects where a routing verdict comes from. All four modes
+# `CLASSIFIER_MODE` selects where a routing verdict comes from. All five modes
 # are first-class and none is required: the local heuristics always run first and
 # an unreachable classifier always fails open.
 CLASSIFIER_MODE_HEURISTICS = "heuristics"
 CLASSIFIER_MODE_UPSTREAM_REUSED = "upstream_reused"
 CLASSIFIER_MODE_LOCAL_OLLAMA = "local_ollama"
+CLASSIFIER_MODE_LOCAL_JEV = "local_jev"
 CLASSIFIER_MODE_EXTERNAL_JEV = "external_jev"
 CLASSIFIER_MODES = (
     CLASSIFIER_MODE_HEURISTICS,
     CLASSIFIER_MODE_UPSTREAM_REUSED,
     CLASSIFIER_MODE_LOCAL_OLLAMA,
+    CLASSIFIER_MODE_LOCAL_JEV,
     CLASSIFIER_MODE_EXTERNAL_JEV,
 )
 # Unset (or `auto`) preserves the original behaviour exactly: an explicitly
@@ -53,6 +55,12 @@ CLASSIFIER_MODE_AUTO = "auto"
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_OLLAMA_CLASSIFIER_MODEL = "qwen2.5:0.5b"
+
+# Local, open-weights decision model: a llama.cpp/llama-server build of
+# chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF. It answers one letter per
+# request, so a verdict is a single forward pass and needs no API key.
+DEFAULT_LOCAL_JEV_URL = "http://127.0.0.1:11435/v1/chat/completions"
+DEFAULT_LOCAL_JEV_MODEL = "jev-style-qwen3.5-2b"
 
 DEFAULT_TRUNCATE_CHARS = 800
 DEFAULT_SNIFF_LIMIT = 512
@@ -255,6 +263,9 @@ class Settings:
     classifier_timeout: float = DEFAULT_CLASSIFIER_TIMEOUT
     classifier_needs_tools_threshold: float = DEFAULT_NEEDS_TOOLS_THRESHOLD
     classifier_supersede_threshold: float = DEFAULT_SUPERSEDE_THRESHOLD
+    # Endpoint of the local llama-server hosting the Jev decision GGUF. Only
+    # consulted by `local_jev`; overridable with LOCAL_JEV_URL.
+    local_jev_url: str = DEFAULT_LOCAL_JEV_URL
     # `auto` derives the mode from what is configured, so an existing deployment
     # keeps working without setting CLASSIFIER_MODE at all.
     classifier_mode: str = CLASSIFIER_MODE_AUTO
@@ -328,7 +339,11 @@ class Settings:
         mode = self.effective_classifier_mode
         if mode == CLASSIFIER_MODE_HEURISTICS or not self.classifier_api_url:
             return False
-        if mode in (CLASSIFIER_MODE_UPSTREAM_REUSED, CLASSIFIER_MODE_LOCAL_OLLAMA):
+        if mode in (
+            CLASSIFIER_MODE_UPSTREAM_REUSED,
+            CLASSIFIER_MODE_LOCAL_OLLAMA,
+            CLASSIFIER_MODE_LOCAL_JEV,
+        ):
             # Local bridges and subscription gateways commonly ignore the bearer
             # token, so a missing key must not silently disable classification.
             return True
@@ -479,6 +494,19 @@ def load_settings(
             or DEFAULT_OLLAMA_CLASSIFIER_MODEL
         )
         classifier_protocol = DEFAULT_CLASSIFIER_PROTOCOL
+    elif resolved_mode == CLASSIFIER_MODE_LOCAL_JEV:
+        # The Jev decision GGUF served by llama-server. No key; the model is
+        # local, so classification never leaves the machine and costs nothing.
+        jev_url = sanitize_url(
+            _first(env, ("LOCAL_JEV_URL", "JEV_API_URL"), DEFAULT_LOCAL_JEV_URL)
+        )
+        classifier_url = classifier_url or jev_url
+        classifier_key = classifier_key or "local"
+        classifier_model = (
+            _first(env, ("CLASSIFIER_MODEL", "JEV_MODEL"), "")
+            or DEFAULT_LOCAL_JEV_MODEL
+        )
+        classifier_protocol = DEFAULT_CLASSIFIER_PROTOCOL
     elif resolved_mode == CLASSIFIER_MODE_EXTERNAL_JEV:
         # Unchanged: a dedicated endpoint, and `blueprint` remains available.
         pass
@@ -520,6 +548,9 @@ def load_settings(
         classifier_supersede_threshold=_as_float(
             _first(env, ("CLASSIFIER_SUPERSEDE_THRESHOLD", "JEV_SUPERSEDE_THRESHOLD"), ""),
             DEFAULT_SUPERSEDE_THRESHOLD,
+        ),
+        local_jev_url=sanitize_url(
+            _first(env, ("LOCAL_JEV_URL",), DEFAULT_LOCAL_JEV_URL)
         ),
         anthropic_model_override=_first(
             env, ("ANTHROPIC_MODEL_OVERRIDE", "BRIDGE_MODEL_OVERRIDE"), ""

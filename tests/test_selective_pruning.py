@@ -12,8 +12,17 @@ from __future__ import annotations
 
 import time
 
-from src.classifier import ALWAYS_KEEP_TOOLS, rank_tools
-from src.config import SELECTIVE_PRUNING_MIN_TOOLS, load_settings
+from src.classifier import (
+    ALWAYS_KEEP_TOOLS,
+    CORE_TOOLS,
+    intent_boosts,
+    rank_tools,
+)
+from src.config import (
+    DEFAULT_SELECTIVE_TOOL_LIMIT,
+    SELECTIVE_PRUNING_MIN_TOOLS,
+    load_settings,
+)
 from src.gateway import apply_selective_pruning, create_app
 
 import httpx
@@ -55,6 +64,9 @@ def names(tools):
     return result
 
 
+ARABIC_PROMPT = "افحص ملف الكود وشغل التيست"  # "inspect the code file and run the test"
+
+
 def build_toolset(count: int = 22) -> list:
     return [
         tool("bash", "Run a shell command on the host"),
@@ -80,6 +92,16 @@ def build_toolset(count: int = 22) -> list:
         tool("pdf_extract", "Extract text from a PDF"),
         tool("fetch_log", "Read a truncated log slice"),
     ][:count]
+
+
+def big_toolset(count: int = 25) -> list:
+    """A realistic wide catalog: the base set, padded above `count`."""
+    tools = build_toolset()
+    while len(tools) < count:
+        tools.append(
+            tool(f"aux_{len(tools)}", f"auxiliary capability number {len(tools)}")
+        )
+    return tools
 
 
 # ------------------------------------------------------------------------------
@@ -326,3 +348,121 @@ async def test_stripped_route_does_not_rank(settings, store, memory):
     assert response.headers["x-proxy-tool-action"] == "Stripped-ZeroTokens"
     after = int(response.headers["x-proxy-tools-after"])
     assert after == 0, "a stripped turn sends no schema at all"
+
+
+# ------------------------------------------------------------------------------
+# Hard cap: the gateway never forwards the whole catalog
+# ------------------------------------------------------------------------------
+def test_core_tools_fit_inside_the_default_limit():
+    assert len(CORE_TOOLS) <= DEFAULT_SELECTIVE_TOOL_LIMIT
+
+
+def test_intent_map_boosts_core_tools_for_an_arabic_prompt():
+    boosts = intent_boosts(ARABIC_PROMPT)
+    assert boosts.get("bash")
+    assert boosts.get("read_file")
+
+
+def test_hard_cap_falls_back_to_only_core_tools_when_there_is_no_evidence():
+    tools = big_toolset(25)
+    kept = rank_tools("tell me a joke about penguins", tools, 5, hard_cap=True)
+
+    assert 0 < len(kept) <= 5
+    assert set(names(kept)).issubset(CORE_TOOLS)
+    # The legacy default is untouched -- the gateway opts in explicitly.
+    assert len(rank_tools("tell me a joke about penguins", tools, 5)) == len(tools)
+
+
+def test_hard_cap_keeps_bash_and_read_file_for_arabic_within_the_limit():
+    kept = names(rank_tools(ARABIC_PROMPT, big_toolset(25), 5, hard_cap=True))
+
+    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
+    assert "bash" in kept
+    assert "read_file" in kept
+
+
+def test_hard_cap_shrinks_a_prompt_with_no_english_overlap():
+    """Non-English intent must not fall back to 'keep everything'."""
+    kept = rank_tools("ترجم هذا النص إلى الإنجليزية", big_toolset(25), 5, hard_cap=True)
+    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
+    assert len(kept) < 25
+
+
+def test_apply_selective_pruning_hard_caps_an_arabic_prompt():
+    settings = load_settings(env={})
+    kept, dropped = apply_selective_pruning(settings, ARABIC_PROMPT, big_toolset(25))
+
+    assert dropped > 0
+    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
+    assert {"bash", "read_file"}.issubset(set(names(kept)))
+
+
+async def test_gateway_caps_an_arabic_prompt_to_five_tools(
+    settings, store, memory, mock_state
+):
+    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
+    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gw", timeout=30.0
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "stream": True,
+                "messages": [{"role": "user", "content": ARABIC_PROMPT}],
+                "tools": big_toolset(25),
+            },
+        )
+
+    assert response.status_code == 200
+    after = int(response.headers["x-proxy-tools-after"])
+    assert after <= 5, "the hard cap must hold for a non-English prompt"
+
+    sent = [tool["function"]["name"] for tool in mock_state.bodies[-1]["tools"]]
+    assert len(sent) == after
+    assert "bash" in sent and "read_file" in sent
+
+
+async def test_tool_turn_does_not_expand_back_to_the_full_catalog(
+    settings, store, memory, mock_state
+):
+    """A mid-loop turn must not silently re-expand the schema."""
+    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
+    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
+
+    messages = [
+        {"role": "user", "content": "search the web for tutorials"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "results"},
+    ]
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gw", timeout=30.0
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "stream": True,
+                "messages": messages,
+                "tools": big_toolset(25),
+            },
+        )
+
+    assert response.status_code == 200
+    after = int(response.headers["x-proxy-tools-after"])
+    assert after <= 5, "a tool turn must not re-expand the catalog"

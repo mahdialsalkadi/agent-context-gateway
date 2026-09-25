@@ -29,6 +29,7 @@ from .config import (
     DEFAULT_SELECTIVE_TOOL_LIMIT,
     CLASSIFIER_MODE_EXTERNAL_JEV,
     CLASSIFIER_MODE_HEURISTICS,
+    CLASSIFIER_MODE_LOCAL_JEV,
     CLASSIFIER_MODE_LOCAL_OLLAMA,
     CLASSIFIER_MODE_UPSTREAM_REUSED,
     ESCAPE_INSTRUCTION,
@@ -80,6 +81,30 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "You are a strict binary classifier. Reply with ONLY a compact JSON object "
     'and no prose, of the form {"<key>": true} or {"<key>": false}.'
 )
+
+# --- local Jev GGUF, single-pass logprob protocol ----------------------------
+# The model answers with exactly one letter; the verdict is read from its log
+# probabilities rather than parsed from prose. A 2B model is far more reliable
+# as a probability source than as a JSON emitter.
+JEV_DECISION_TEMPLATE = (
+    "You are a decision function. Read the state, then answer the question by "
+    "choosing exactly one option.\n"
+    "[State] {state}\n"
+    "[Question] {question}\n"
+    "[Options]\n"
+    "A. Yes\n"
+    "B. No\n"
+    "Answer:"
+)
+JEV_NEEDS_TOOLS_QUESTION = (
+    "Does this request require running commands, editing files, searching web, "
+    "or code execution?"
+)
+JEV_SUPERSEDE_QUESTION = "Does the new value supersede the existing value?"
+
+# A 2B local model exists to be fast. If llama-server cannot answer within this
+# budget the turn fails open to the local heuristics rather than stalling.
+LOCAL_JEV_TIMEOUT_SECONDS = 0.4
 
 
 def is_reasoning_model(
@@ -140,7 +165,49 @@ def strip_escape_instruction(text: str) -> str:
 # after a strip. Kept verbatim, always.
 ALWAYS_KEEP_TOOLS = frozenset({"bash", "shell", "terminal", "fetch_log", "read_file"})
 
+# The absolute floor for the hard cap. When the gateway offers a large schema
+# and has no evidence at all about the turn, these are the only names it is
+# allowed to leave behind: a shell for the escape-replay contract, file I/O for
+# re-establishing context, and the gateway's own retrieval surface. The set has
+# exactly DEFAULT_SELECTIVE_TOOL_LIMIT members so a capped turn can never exceed
+# the configured ceiling.
+CORE_TOOLS = frozenset({"bash", "read_file", "edit_file", "write_file", "fetch_log"})
+
 _TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+
+# A prompt with no English lexical overlap -- Arabic, or anything the BM25
+# tokenizer cannot read -- used to score 0.0 on every tool, which hit the
+# historical "no evidence, so keep everything" fallback and leaked the whole
+# catalog back to the model. This table gives such prompts a cheap,
+# deterministic way to name the two or three tools they actually need.
+# Matching is a plain substring test on the lowered prompt, so Arabic morphology
+# ("وشغل" contains "شغل") still fires.
+INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "bash": ("شغل", "نفذ", "اوامر", "تيرمينال", "كوماند", "run", "exec", "terminal", "test", "build"),
+    "read_file": ("اقرا", "اقرأ", "افحص", "شوف", "ملف", "كود", "read", "inspect", "view", "open", "show"),
+    "edit_file": ("عدل", "اكتب", "غير", "صلح", "write", "edit", "modify", "patch", "fix"),
+    "write_file": ("اكتب", "write", "create", "save"),
+    "web_search": ("ابحث", "دور", "انترنت", "جوجل", "search", "lookup", "google", "find"),
+}
+
+# One intent hit is worth more than any single BM25 term, because it is a direct
+# statement about which tool category the turn belongs to.
+INTENT_BOOST = 5.0
+
+
+def intent_boosts(prompt: str) -> Dict[str, float]:
+    """Per-tool score boosts for intent the BM25 tokenizer cannot see.
+
+    Pure and allocation-light: a few dozen substring checks on the hot path.
+    """
+    text = (prompt or "").lower()
+    if not text:
+        return {}
+    return {
+        name: INTENT_BOOST
+        for name, keywords in INTENT_KEYWORDS.items()
+        if any(keyword in text for keyword in keywords)
+    }
 
 # Words too common to carry signal about which tool a turn needs. Without this,
 # "search the web for tutorials" ranks `screenshot` because its description
@@ -206,16 +273,69 @@ def _tool_text(tool: Dict[str, Any]) -> Tuple[str, str]:
     return name, f"{name} {description}"
 
 
+def _hard_cap(
+    tools: List[Dict[str, Any]],
+    scores: List[float],
+    boosts: Dict[str, float],
+    keep_limit: int,
+) -> List[Dict[str, Any]]:
+    """An absolute ceiling on a large schema: never the catalog, never > limit.
+
+    Core I/O tools are served first; relevance fills whatever is left. When the
+    prompt produced no evidence at all -- every BM25 score 0.0 and no intent
+    match -- only the core tools survive, instead of the historical
+    "keep everything" fallback that leaked 40+ schemas to the model.
+    """
+    core_indices = [
+        index
+        for index, tool in enumerate(tools)
+        if _tool_text(tool)[0].lower() in CORE_TOOLS
+    ]
+    combined = [
+        score + boosts.get(_tool_text(tool)[0].lower(), 0.0)
+        for tool, score in zip(tools, scores)
+    ]
+    positive = [index for index, value in enumerate(combined) if value > 0.0]
+    if not positive:
+        return [tools[index] for index in core_indices[:keep_limit]]
+
+    selected = sorted(positive, key=lambda index: combined[index], reverse=True)[
+        :keep_limit
+    ]
+    # Guarantee the core set inside the ceiling: displace the weakest non-core
+    # pick rather than overflowing the limit.
+    core_selected = set(core_indices)
+    for index in core_indices:
+        if index in selected:
+            continue
+        if len(selected) < keep_limit:
+            selected.append(index)
+            continue
+        for candidate in reversed(selected):
+            if candidate not in core_selected:
+                selected[selected.index(candidate)] = index
+                break
+
+    keep = set(selected)
+    return [tool for index, tool in enumerate(tools) if index in keep]
+
+
 def rank_tools(
     prompt: str,
     tools: List[Dict[str, Any]],
     keep_limit: int = DEFAULT_SELECTIVE_TOOL_LIMIT,
+    hard_cap: bool = False,
 ) -> List[Dict[str, Any]]:
     """The tools worth sending, ranked by relevance to the prompt.
 
     Mission-critical I/O tools are always preserved; everything else competes on
     a BM25 score of the prompt against each tool's name and description. Pure
     and local: no model call, well under 2ms for realistic payload sizes.
+
+    `hard_cap` switches from the conservative default (when there is no evidence
+    the whole schema is returned) to the gateway's absolute ceiling: a large
+    schema is never returned whole, multilingual intent is boosted, and the
+    result is always `<= keep_limit`. The gateway path passes `hard_cap=True`.
     """
     try:
         keep_limit = max(1, int(keep_limit))
@@ -225,10 +345,15 @@ def rank_tools(
             if token not in STOPWORDS
         ]
         if not query_tokens:
+            if hard_cap:
+                return _hard_cap(tools, [0.0] * len(tools), intent_boosts(prompt), keep_limit)
             return list(tools)
 
         documents = [_TOKEN_RE.findall(_tool_text(tool)[1].lower()) for tool in tools]
         scores = _bm25_scores(query_tokens, documents)
+
+        if hard_cap:
+            return _hard_cap(tools, scores, intent_boosts(prompt), keep_limit)
 
         # Only shrink the schema when there is actual evidence. A prompt that
         # matches no tool at all says nothing about which tools matter, so the
@@ -330,6 +455,60 @@ def parse_classifier_bool(text: str, key: str) -> Optional[bool]:
     return None
 
 
+def parse_jev_logprobs(data: Any) -> Optional[float]:
+    """P("A") from a `logprobs=True` completion, or None if unusable.
+
+    llama-server returns the chosen token plus its `top_logprobs` alternates.
+    Both letters are looked for in that first position, including the chosen
+    token itself, so a verdict is available whether the model chose A or B.
+    """
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    logprobs = first.get("logprobs") if isinstance(first, dict) else None
+    if not isinstance(logprobs, dict):
+        return None
+    content = logprobs.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    entry = content[0]
+    if not isinstance(entry, dict):
+        return None
+
+    candidates: List[Dict[str, Any]] = [
+        item for item in (entry.get("top_logprobs") or []) if isinstance(item, dict)
+    ]
+    candidates.append(entry)
+
+    logprob_a: Optional[float] = None
+    logprob_b: Optional[float] = None
+    for item in candidates:
+        token = str(item.get("token") or "").strip().strip('"').upper()
+        value = item.get("logprob")
+        if not isinstance(value, (int, float)):
+            continue
+        if token.startswith("A") and logprob_a is None:
+            logprob_a = float(value)
+        elif token.startswith("B") and logprob_b is None:
+            logprob_b = float(value)
+
+    if logprob_a is None and logprob_b is None:
+        return None
+    if logprob_b is None:
+        return 1.0
+    if logprob_a is None:
+        return 0.0
+
+    # Softmax over just the two options: P(A) = e^a / (e^a + e^b).
+    exp_a = math.exp(logprob_a)
+    exp_b = math.exp(logprob_b)
+    total = exp_a + exp_b
+    if total <= 0.0:
+        return None
+    return exp_a / total
+
+
 @dataclass
 class Decision:
     """Outcome of a tool-routing evaluation."""
@@ -353,6 +532,8 @@ class Classifier:
     * `upstream_reused` -- the endpoint and credential are the upstream's own, so
       a verdict costs nothing beyond the subscription already in use.
     * `local_ollama`    -- a local runner; same OpenAI payload shape, no internet.
+    * `local_jev`       -- the Jev-Style Qwen3.5-2B GGUF on llama-server. One
+      forward pass, one letter, read from `logprobs` in under 400ms.
     * `external_jev`    -- a dedicated endpoint (OpenRouter/OpenCode), where the
       `blueprint` protocol is also available.
 
@@ -388,13 +569,16 @@ class Classifier:
         self._cache[key] = (time.time(), verdict)
 
     # --- transport seam ----------------------------------------------------
-    async def _post(self, url: str, payload: Dict[str, Any]) -> Optional[Any]:
+    async def _post(
+        self, url: str, payload: Dict[str, Any], timeout: Optional[float] = None
+    ) -> Optional[Any]:
         """POST JSON to the classifier. Returns None on any failure."""
         headers = {"Content-Type": "application/json"}
         if self.settings.classifier_api_key:
             headers["Authorization"] = f"Bearer {self.settings.classifier_api_key}"
+        effective_timeout = self.settings.classifier_timeout if timeout is None else timeout
         try:
-            async with httpx.AsyncClient(timeout=self.settings.classifier_timeout) as client:
+            async with httpx.AsyncClient(timeout=effective_timeout) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     return None
@@ -436,6 +620,57 @@ class Classifier:
             ],
         }
 
+    def _build_jev_payload(self, state: str, question: str) -> Dict[str, Any]:
+        """One-letter decision payload for the local Jev GGUF."""
+        return {
+            "model": self.settings.classifier_model,
+            "temperature": 0,
+            "max_tokens": 1,
+            "logprobs": True,
+            "top_logprobs": 10,
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": JEV_DECISION_TEMPLATE.format(
+                        state=state, question=question
+                    ),
+                }
+            ],
+        }
+
+    async def classify_via_local_jev(
+        self,
+        prompt: str,
+        question: str = JEV_NEEDS_TOOLS_QUESTION,
+        threshold: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Single-pass Yes/No read of the Jev GGUF's log probabilities.
+
+        Returns `{"needs_tools": bool, "probability": float}` or None when the
+        endpoint is unreachable, times out, or returns an unusable shape. Never
+        raises: a local classifier that is down must fail open.
+        """
+        limit = (
+            self.settings.classifier_needs_tools_threshold
+            if threshold is None
+            else threshold
+        )
+        try:
+            data = await self._post(
+                self.settings.classifier_api_url,
+                self._build_jev_payload(prompt, question),
+                LOCAL_JEV_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+        if data is None:
+            return None
+        probability = parse_jev_logprobs(data)
+        if probability is None:
+            return None
+        return {"needs_tools": probability >= limit, "probability": probability}
+
     async def ask(
         self, instruction: str, state: str, key: str, threshold: float
     ) -> Optional[bool]:
@@ -452,6 +687,19 @@ class Classifier:
             return cached
 
         self.calls += 1
+        if self.mode == CLASSIFIER_MODE_LOCAL_JEV:
+            question = (
+                JEV_NEEDS_TOOLS_QUESTION
+                if key == "needs_tools"
+                else JEV_SUPERSEDE_QUESTION
+            )
+            result = await self.classify_via_local_jev(state, question, threshold)
+            if result is None:
+                return None
+            verdict = bool(result["needs_tools"])
+            self._cache_put(cache_key, verdict)
+            return verdict
+
         data = await self._post(
             settings.classifier_api_url, self._build_payload(instruction, state, key)
         )
@@ -604,13 +852,22 @@ def get_classifier(settings: Optional[Settings] = None) -> Classifier:
 
 __all__ = [
     "ALWAYS_KEEP_TOOLS",
+    "CORE_TOOLS",
+    "INTENT_BOOST",
+    "INTENT_KEYWORDS",
     "Decision",
     "Classifier",
     "CLASSIFIER_MODE_EXTERNAL_JEV",
     "CLASSIFIER_MODE_HEURISTICS",
+    "CLASSIFIER_MODE_LOCAL_JEV",
     "CLASSIFIER_MODE_LOCAL_OLLAMA",
     "CLASSIFIER_MODE_UPSTREAM_REUSED",
+    "JEV_DECISION_TEMPLATE",
+    "JEV_NEEDS_TOOLS_QUESTION",
+    "JEV_SUPERSEDE_QUESTION",
+    "LOCAL_JEV_TIMEOUT_SECONDS",
     "rank_tools",
+    "intent_boosts",
     "ESCAPE_INSTRUCTION",
     "ESCAPE_TOKEN",
     "decide_route",
@@ -619,6 +876,7 @@ __all__ = [
     "inject_escape_instruction",
     "is_reasoning_model",
     "parse_classifier_bool",
+    "parse_jev_logprobs",
     "reply_text",
     "strip_escape_instruction",
 ]

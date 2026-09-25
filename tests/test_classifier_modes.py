@@ -25,11 +25,16 @@ import httpx
 import pytest
 
 from src.artifacts import ArtifactStore
-from src.classifier import Classifier, decide_route
+from src.classifier import (
+    Classifier,
+    decide_route,
+    parse_jev_logprobs,
+)
 from src.config import (
     CLASSIFIER_MODE_AUTO,
     CLASSIFIER_MODE_EXTERNAL_JEV,
     CLASSIFIER_MODE_HEURISTICS,
+    CLASSIFIER_MODE_LOCAL_JEV,
     CLASSIFIER_MODE_LOCAL_OLLAMA,
     CLASSIFIER_MODE_UPSTREAM_REUSED,
     CLASSIFIER_MODES,
@@ -40,7 +45,14 @@ from src.config import (
 from src.gateway import main
 from src.memory import GraphMemory
 
-SHIPPED_PROFILES = ("antigravity", "claude", "codex", "hermes", "openrouter")
+SHIPPED_PROFILES = (
+    "antigravity",
+    "claude",
+    "codex",
+    "hermes",
+    "local_jev",
+    "openrouter",
+)
 TOOL_SCHEMA = [
     {"type": "function", "function": {"name": "terminal", "parameters": {"type": "object"}}}
 ]
@@ -529,3 +541,167 @@ def test_mode_change_is_reflected_by_the_singleton(monkeypatch):
 
 def test_auto_mode_constant_is_not_a_real_mode():
     assert CLASSIFIER_MODE_AUTO not in CLASSIFIER_MODES
+
+
+# ------------------------------------------------------------------------------
+# local_jev: the Jev-Style Qwen3.5-2B GGUF on llama-server
+# ------------------------------------------------------------------------------
+def test_local_jev_defaults_to_the_llama_server_endpoint():
+    settings = load_settings(env={"CLASSIFIER_MODE": "local_jev"})
+
+    assert settings.effective_classifier_mode == CLASSIFIER_MODE_LOCAL_JEV
+    assert settings.classifier_api_url == "http://127.0.0.1:11435/v1/chat/completions"
+    assert settings.classifier_model == "jev-style-qwen3.5-2b"
+    # A local model needs no credential, and must not be mistaken for a loop.
+    assert settings.classifier_enabled is True
+    assert settings.is_loop_upstream() is False
+
+
+def test_local_jev_url_is_configurable():
+    settings = load_settings(
+        env={
+            "CLASSIFIER_MODE": "local_jev",
+            "LOCAL_JEV_URL": "http://127.0.0.1:9000/v1/chat/completions",
+        }
+    )
+    assert settings.local_jev_url == "http://127.0.0.1:9000/v1/chat/completions"
+    assert settings.classifier_api_url == "http://127.0.0.1:9000/v1/chat/completions"
+
+
+def test_jev_payload_asks_for_one_token_with_logprobs():
+    settings = load_settings(env={"CLASSIFIER_MODE": "local_jev"})
+    payload = Classifier(settings)._build_jev_payload("do the thing", "Does it matter?")
+
+    assert payload["max_tokens"] == 1
+    assert payload["logprobs"] is True
+    assert payload["top_logprobs"] == 10
+    assert payload["temperature"] == 0
+    assert payload["stream"] is False
+    content = payload["messages"][0]["content"]
+    assert "You are a decision function" in content
+    assert "[State] do the thing" in content
+    assert "[Question] Does it matter?" in content
+    assert "A. Yes" in content and "B. No" in content
+
+
+def test_parse_jev_logprobs_computes_the_softmax():
+    data = {
+        "choices": [
+            {
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "A",
+                            "logprob": -0.1,
+                            "top_logprobs": [
+                                {"token": "A", "logprob": -0.1},
+                                {"token": "B", "logprob": -2.3},
+                            ],
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    probability = parse_jev_logprobs(data)
+
+    assert probability is not None
+    assert probability > 0.8
+
+
+def test_parse_jev_logprobs_returns_none_without_logprobs():
+    assert parse_jev_logprobs({"choices": [{"message": {"content": "A"}}]}) is None
+
+
+async def test_local_jev_classifies_from_the_first_token_logprobs(monkeypatch):
+    settings = load_settings(
+        env={"CLASSIFIER_MODE": "local_jev", "CLASSIFIER_NEEDS_TOOLS_THRESHOLD": "0.5"}
+    )
+    classifier = Classifier(settings)
+    seen = {}
+
+    async def fake_post(url, payload, timeout=None):
+        seen["url"] = url
+        seen["payload"] = payload
+        seen["timeout"] = timeout
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {
+                                "token": "A",
+                                "logprob": -0.01,
+                                "top_logprobs": [
+                                    {"token": "A", "logprob": -0.01},
+                                    {"token": "B", "logprob": -5.0},
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(classifier, "_post", fake_post)
+
+    assert await classifier.needs_tools("run the tests and fix the build") is True
+    assert seen["url"].endswith(":11435/v1/chat/completions")
+    assert seen["payload"]["max_tokens"] == 1
+    assert seen["payload"]["logprobs"] is True
+    # The whole point of a 2B local model: a hard latency budget.
+    assert seen["timeout"] is not None and seen["timeout"] <= 0.4
+
+
+async def test_local_jev_fails_open_when_the_endpoint_is_unreachable(monkeypatch, settings):
+    resolved = replace(settings, classifier_mode=CLASSIFIER_MODE_LOCAL_JEV)
+    classifier = Classifier(resolved)
+
+    async def dead_post(url, payload, timeout=None):
+        return None
+
+    monkeypatch.setattr(classifier, "_post", dead_post)
+
+    assert await classifier.needs_tools("summarise the deployment plan") is None
+    decision = await decide_route(
+        resolved,
+        classifier,
+        "some-model",
+        "an ambiguous medium length request about the relay",
+        True,
+        False,
+    )
+    assert decision.route == "Classifier-FailOpen"
+    assert decision.stripped is False
+
+
+async def test_local_jev_resolves_memory_conflicts_with_the_supersede_question(monkeypatch):
+    settings = load_settings(env={"CLASSIFIER_MODE": "local_jev"})
+    classifier = Classifier(settings)
+    seen = {}
+
+    async def fake_post(url, payload, timeout=None):
+        seen["prompt"] = payload["messages"][0]["content"]
+        return {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {
+                                "token": "B",
+                                "logprob": -0.01,
+                                "top_logprobs": [
+                                    {"token": "A", "logprob": -5.0},
+                                    {"token": "B", "logprob": -0.01},
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(classifier, "_post", fake_post)
+
+    assert await classifier.value_supersedes("billing", "uses", "postgres", "mysql") is False
+    assert "supersede" in seen["prompt"].lower()

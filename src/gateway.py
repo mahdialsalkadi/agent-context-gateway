@@ -139,11 +139,13 @@ async def _close_quietly(
 def apply_selective_pruning(
     settings: Settings, prompt: str, tools: List[Dict[str, Any]]
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Maybe shrink a tool schema to the tools this prompt implies.
+    """Shrink a large tool schema to the tools this turn can actually need.
 
-    Returns (tools, dropped_count). Conservative by design: only fires above
-    SELECTIVE_PRUNING_MIN_TOOLS, and `rank_tools` itself keeps everything when
-    the prompt gives no evidence for any tool.
+    Returns (tools, dropped_count). Only fires above
+    SELECTIVE_PRUNING_MIN_TOOLS, but from there it is an *absolute* cap:
+    `rank_tools` is called in hard-cap mode, so no prompt -- including one in a
+    language BM25 cannot read -- can return the whole catalog, and the result is
+    always `<= settings.selective_tool_limit`.
     """
     if (
         not settings.enable_selective_pruning
@@ -152,7 +154,9 @@ def apply_selective_pruning(
     ):
         return tools, 0
     try:
-        kept = rank_tools(prompt, tools, settings.selective_tool_limit)
+        kept = rank_tools(
+            prompt, tools, settings.selective_tool_limit, hard_cap=True
+        )
     except Exception:
         return tools, 0
     if len(kept) >= len(tools):
@@ -492,10 +496,12 @@ def create_app(
         # Selective sub-tool pruning: with a large schema, keep only the tools
         # this prompt implies instead of choosing between everything and nothing.
         # Must precede the all-or-nothing strip so a stripped turn cannot rank.
+        # Note the absence of `not is_tool_turn`: a mid-loop turn must not
+        # silently expand back to the full catalog just because the model is
+        # waiting on a result. The cap is unconditional.
         selective_count = 0
         if (
             has_tools
-            and not is_tool_turn
             and not decision.stripped
             and body.get("tool_choice") in (None, "auto")
         ):
@@ -723,6 +729,16 @@ def create_app(
             decision.tool_action = "Retained-Forced"
 
         route, tool_action = decision.route, decision.tool_action
+
+        # Same absolute cap on the Anthropic surface: a large schema is never
+        # forwarded whole. Skipped for an explicit tool choice and for an
+        # all-or-nothing strip, which removes the schema entirely.
+        if has_tools and not forced_tools and not decision.stripped:
+            pruned, dropped = apply_selective_pruning(cfg(), prompt, tools)
+            if dropped:
+                translated["tools"] = pruned
+                tools = pruned
+                has_tools = bool(pruned)
 
         if decision.stripped:
             translated.pop("tools", None)

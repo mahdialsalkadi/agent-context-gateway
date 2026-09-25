@@ -332,7 +332,10 @@ class GraphMemory:
     async def ingest_async(self, session_id: str, prompt: str, response: str, classifier) -> int:
         """Ingest a completed turn, resolving conflicts before writing.
 
-        Called from a background task, so it must never raise.
+        Called from a background task, so it must never raise. Conflict
+        resolution goes through `classifier.value_supersedes`, so it works in
+        every mode -- including `local_jev`, where the question is answered by
+        the same single-pass logprob decision as `needs_tools`.
         """
         try:
             triples = extract_triples(f"{prompt}\n{response}")

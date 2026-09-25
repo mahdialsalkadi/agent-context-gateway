@@ -22,8 +22,11 @@ own machine — no second provider, no second key. See
 
 ```bash
 pip install -e .
-agent-gateway init        # 60-second interactive setup, writes .env for you
+agent-gateway             # guided launcher: agent, strategy, port -- then starts
+agent-gateway init        # or the fuller 60-second setup, writes .env for you
 agent-gateway run claude  # starts the gateway AND Claude Code, wired together
+
+agent-gateway install-shim  # one global `agent-gateway` command in ~/.local/bin
 ```
 
 That is the whole quickstart. `init` asks which agent you use and what your
@@ -175,13 +178,14 @@ Anthropic surface exists so Claude Code needs no shim.
 
 ## Zero-cost mode
 
-There are three ways to run the whole system for $0, and they compose:
+There are four ways to run the whole system for $0, and they compose:
 
 | Mode | Extra cost | Trade-off |
 | --- | --- | --- |
 | `CLASSIFIER_MODE=heuristics` | **none** — zero network calls | Only unambiguous turns are settled; ambiguous ones keep their tools |
 | `CLASSIFIER_MODE=upstream_reused` | **none beyond what you already pay** | Spends a few tokens of the subscription you're already using |
 | `CLASSIFIER_MODE=local_ollama` | **none** — stays on your machine | Needs a local model pulled (default `qwen2.5:0.5b`) |
+| `CLASSIFIER_MODE=local_jev` | **none** — a 2B GGUF on your machine | One forward pass per ambiguous turn (~15ms); needs `llama-server` |
 
 ```bash
 # Cheapest of all: local rules, identical transport behaviour.
@@ -193,6 +197,9 @@ CLASSIFIER_MODE=upstream_reused CLASSIFIER_MODEL=gemini-2.5-flash \
 
 # Judge locally; nothing leaves the machine.
 CLASSIFIER_MODE=local_ollama python -m src.gateway
+
+# Judge locally with a purpose-built 2B decision model (single token, logprobs).
+CLASSIFIER_MODE=local_jev python -m src.gateway
 ```
 
 **The bigger saving is orthogonal to the classifier.** Tool-schema pruning and
@@ -211,6 +218,32 @@ python -m src.gateway --profile antigravity
 
 Antigravity occupies `8080`, so the gateway takes `8091`. If you change that,
 do not reuse 8080 — the startup guard will (correctly) refuse to start.
+
+### Local Jev GGUF (`CLASSIFIER_MODE=local_jev`)
+
+A purpose-built decision model —
+[`chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF`](https://huggingface.co/chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF)
+— served by `llama-server`. It answers a single letter per request, which the
+gateway reads from the token **log probabilities** (`max_tokens=1`,
+`logprobs=true`, `top_logprobs=10`) and turns into `P(A) = e^a / (e^a + e^b)`.
+One forward pass, roughly 15ms, entirely offline.
+
+```bash
+# Terminal 1 -- serve the decision model on port 11435.
+llama-server -hf chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-GGUF:Q4_K_M --port 11435
+
+# Terminal 2 -- run the gateway against it.
+agent-gateway start --profile local_jev
+# or, choosing it from the interactive launcher:
+agent-gateway        # question 2 -> "Local Jev-Style Qwen3.5-2B GGUF"
+```
+
+The endpoint is overridable with `LOCAL_JEV_URL` (default
+`http://127.0.0.1:11435/v1/chat/completions`). A decision that does not arrive
+within 400ms fails open to the local heuristics: the tools are kept, and no
+request is ever delayed by a slow classifier. The same single-pass protocol also
+answers the memory conflict question (*"does the new value supersede the existing
+value?"*), so relation updates stay consistent in `local_jev` mode.
 
 ---
 
@@ -343,7 +376,7 @@ for the annotated template.
 
 ### Classifier modes
 
-`CLASSIFIER_MODE` selects where a routing verdict comes from. All four are
+`CLASSIFIER_MODE` selects where a routing verdict comes from. All five are
 first-class; none is required. The local heuristics always run first, and every
 mode fails open.
 
@@ -352,6 +385,7 @@ mode fails open.
 | `heuristics` | *none — no network call at all* | — | **$0** |
 | `upstream_reused` | `UPSTREAM_BASE_URL/chat/completions` | borrowed from `UPSTREAM_API_KEY` | **$0** (same subscription) |
 | `local_ollama` | `OLLAMA_BASE_URL`, default `http://127.0.0.1:11434/v1` | none needed | **$0** (local) |
+| `local_jev` | `LOCAL_JEV_URL`, default `http://127.0.0.1:11435/v1/chat/completions` | none needed | **$0** (local, ~15ms) |
 | `external_jev` | `CLASSIFIER_API_URL` / `JEV_API_URL` | `CLASSIFIER_API_KEY`, or the name of another variable | whatever that endpoint bills |
 
 Leaving `CLASSIFIER_MODE` unset is `auto`, which preserves the original
@@ -365,10 +399,11 @@ requiring the call to never happen.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CLASSIFIER_MODE` | `auto` | `heuristics`, `upstream_reused`, `local_ollama`, `external_jev` |
+| `CLASSIFIER_MODE` | `auto` | `heuristics`, `upstream_reused`, `local_ollama`, `local_jev`, `external_jev` |
 | `CLASSIFIER_API_URL` | unset | Dedicated endpoint (`external_jev`) |
-| `CLASSIFIER_MODEL` | mode-dependent | `gpt-4o-mini`, or `qwen2.5:0.5b` for `local_ollama` |
+| `CLASSIFIER_MODEL` | mode-dependent | `gpt-4o-mini`, `qwen2.5:0.5b` for `local_ollama`, `jev-style-qwen3.5-2b` for `local_jev` |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local runner for `local_ollama` |
+| `LOCAL_JEV_URL` | `http://127.0.0.1:11435/v1/chat/completions` | `llama-server` endpoint for `local_jev` |
 | `CLASSIFIER_API_KEY` / `CLASSIFIER_API_KEY_ENV` | — | Key, or the *name* of another variable holding it |
 | `CLASSIFIER_PROTOCOL` | `openai` | `openai`, or `blueprint` (a `external_jev`-only shape) |
 | `CLASSIFIER_TIMEOUT_SECONDS` | `2.5` | Above this, fail open |
@@ -523,8 +558,10 @@ agent-gateway stats --json     # for your own dashboards
 ```bash
 pip install -e .               # puts `agent-gateway` on your PATH
 
-agent-gateway init             # interactive setup wizard -> writes .env
-agent-gateway run claude       # gateway (auto-started) + agent in one command
+agent-gateway                   # no args -> guided launcher (agent, strategy, port)
+agent-gateway interactive       # the same launcher, explicitly
+agent-gateway init              # interactive setup wizard -> writes .env
+agent-gateway run claude        # gateway (auto-started) + agent in one command
 agent-gateway start [--profile NAME] [--port N] [--daemon]
 agent-gateway stop              # stops what this CLI started; never guesses PIDs
 agent-gateway status            # pid, health, mode, profile, foreign-service flag
@@ -532,7 +569,28 @@ agent-gateway doctor            # 6-point diagnosis with copy-paste fixes
 agent-gateway stats [--live|--json]
 agent-gateway ui                # open the browser dashboard
 agent-gateway test              # the offline suite, no keys needed
+agent-gateway install-shim      # universal ~/.local/bin/agent-gateway wrapper
 agent-gateway service install   # systemd user unit, written AND enabled
+```
+
+The launcher writes or updates `.env`, picks a free port when `8090`/`8080` are
+occupied, starts the gateway in the background, and — if you chose an agent —
+hands off to `agent-gateway run <agent>`. It also installs the global wrapper
+below, so the next command works from any directory and any shell.
+
+### One command, everywhere: the global shim
+
+`agent-gateway install-shim` (and `init`, and the interactive launcher) writes an
+executable wrapper to `~/.local/bin/agent-gateway` that pins this project's
+virtualenv and exports `PYTHONPATH`. No `cd` into the repo, no
+`source .venv/bin/activate[.fish]`:
+
+```bash
+agent-gateway install-shim
+# wrote /home/you/.local/bin/agent-gateway
+# if ~/.local/bin is not on PATH:
+#   bash/zsh:  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile && . ~/.profile
+#   fish:      fish_add_path $HOME/.local/bin
 ```
 
 `agent-gateway run` knows how to wire Claude Code (`ANTHROPIC_BASE_URL`), Hermes

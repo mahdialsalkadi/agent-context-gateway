@@ -20,11 +20,15 @@ from src.cli import (
     build_agent_command,
     build_agent_env,
     build_init_preset,
+    build_wizard_preset,
     cmd_doctor,
     cmd_init,
+    cmd_interactive,
+    install_global_wrapper,
     render_doctor,
     render_env_file,
     run_checks,
+    update_env_file,
 )
 from src.ux import CliError
 
@@ -348,3 +352,122 @@ def test_unexpected_errors_still_traceback(monkeypatch):
     monkeypatch.setattr(cli, "cmd_status", explode)
     with pytest.raises(RuntimeError):
         cli.main(["status"])
+
+
+# ------------------------------------------------------------------------------
+# Global wrapper: one command from any directory, any shell
+# ------------------------------------------------------------------------------
+def test_install_global_wrapper_writes_an_executable_shim(tmp_path):
+    path = install_global_wrapper(
+        repo_dir=tmp_path,
+        bin_dir=tmp_path / "bin",
+        venv_python=tmp_path / "bin" / "python",
+    )
+
+    assert path == tmp_path / "bin" / "agent-gateway"
+    assert os.access(path, os.X_OK), "the wrapper must be executable"
+    text = path.read_text(encoding="utf-8")
+    assert "-m src.cli" in text
+    assert "exec" in text
+    assert str(tmp_path) in text, "the wrapper pins this project's directory"
+    assert "PYTHONPATH" in text, "must work without `cd`"
+
+
+def test_install_shim_subcommand_is_wired():
+    args = cli.build_parser().parse_args(["install-shim"])
+    assert getattr(args, "func", None)
+
+
+def test_path_guidance_mentions_fish_and_bash():
+    guidance = cli.path_guidance("/x/bin")
+    assert "fish" in guidance
+    assert "bash" in guidance.lower()
+
+
+# ------------------------------------------------------------------------------
+# Interactive launcher
+# ------------------------------------------------------------------------------
+def test_wizard_preset_selects_local_jev_and_preserves_upstream():
+    preset = build_wizard_preset(
+        "claude",
+        "local_jev",
+        8091,
+        {"UPSTREAM_BASE_URL": "https://api.example/v1", "UPSTREAM_API_KEY": "k"},
+    )
+
+    assert preset["CLASSIFIER_MODE"] == "local_jev"
+    assert preset["GATEWAY_PORT"] == "8091"
+    assert preset["UPSTREAM_BASE_URL"] == "https://api.example/v1"
+    assert preset["UPSTREAM_API_KEY"] == "k"
+    assert preset["ANTHROPIC_SURFACE"] == "1"
+    assert preset["LOCAL_JEV_URL"].startswith("http://127.0.0.1:11435")
+
+
+def test_wizard_preset_standalone_has_no_surface_flag():
+    preset = build_wizard_preset("standalone", "heuristics", 8090)
+    assert "ANTHROPIC_SURFACE" not in preset
+    assert preset["CLASSIFIER_MODE"] == "heuristics"
+
+
+def test_update_env_file_merges_without_duplicating_keys(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "# keep me\nGATEWAY_PORT=8090\nUPSTREAM_BASE_URL=http://old/v1\n",
+        encoding="utf-8",
+    )
+
+    update_env_file(env, {"GATEWAY_PORT": "8091", "CLASSIFIER_MODE": "local_jev"})
+    text = env.read_text(encoding="utf-8")
+
+    assert "# keep me" in text
+    assert text.count("GATEWAY_PORT=") == 1
+    assert "GATEWAY_PORT=8091" in text
+    assert "UPSTREAM_BASE_URL=http://old/v1" in text
+    assert "CLASSIFIER_MODE=local_jev" in text
+
+
+def test_suggest_port_prefers_8091_when_8080_is_busy(monkeypatch):
+    monkeypatch.setattr(
+        cli, "port_in_use", lambda port, host="127.0.0.1": port in (8080, 8090)
+    )
+    assert cli.suggest_port() == 8091
+
+
+def test_suggest_port_keeps_8090_when_everything_is_free(monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    assert cli.suggest_port() == 8090
+
+
+def test_cmd_interactive_writes_env_from_answers(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    answers = iter(["2", "2", ""])  # Claude Code, local_jev, default port
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "CLASSIFIER_MODE=local_jev" in text
+    assert "ANTHROPIC_SURFACE=1" in text
+
+
+def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+    started = {}
+    monkeypatch.setattr(
+        cli, "_ensure_gateway_running", lambda: started.setdefault("up", True)
+    )
+
+    args = cli.build_parser().parse_args(["interactive"])
+    answers = iter(["4", "1", ""])  # standalone, heuristics, default port
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    assert started.get("up") is True
+    assert "CLASSIFIER_MODE=heuristics" in (tmp_path / ".env").read_text()
