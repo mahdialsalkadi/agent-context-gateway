@@ -1,0 +1,72 @@
+# ==============================================================================
+# agent-context-gateway -- one-command launch
+#
+#   cp .env.example .env        # then set UPSTREAM_BASE_URL / UPSTREAM_API_KEY
+#   docker compose -f docker/docker-compose.yml up --build
+#
+#   curl http://127.0.0.1:8090/health
+#
+# The port is published on 127.0.0.1 only. If you need to expose it on a network,
+# set GATEWAY_API_KEY in .env first -- otherwise anything that can reach the port
+# can spend your upstream credits.
+# ==============================================================================
+name: agent-context-gateway
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agent-context-gateway:0.1.0
+    container_name: agent-context-gateway
+
+    # Secrets and tuning come from .env, which is gitignored.
+    env_file:
+      - ../.env
+
+    environment:
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: "8090"
+      DATA_DIR: /data
+      LOG_DIR: /logs
+      # Inside this container /dev/shm is the tmpfs mounted below, shared by the
+      # gateway and the sentinel that entrypoint.sh starts alongside it.
+      SHM_CACHE_DIR: /dev/shm/agent_gateway
+      SENTINEL_INTERVAL: "86400"
+
+    ports:
+      # Loopback-only publication. Change to "8090:8090" only behind a firewall
+      # and with GATEWAY_API_KEY set.
+      - "127.0.0.1:8090:8090"
+
+    volumes:
+      - gateway-data:/data
+      - gateway-logs:/logs
+
+    # The default Docker /dev/shm is 64MB, well under the 180MB eviction ceiling,
+    # so the cache would start evicting early.
+    tmpfs:
+      - /dev/shm:size=256m,mode=1777
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Modest hardening: the process needs the network, /data, /logs and /dev/shm.
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  gateway-data:
+    driver: local
+  gateway-logs:
+    driver: local
