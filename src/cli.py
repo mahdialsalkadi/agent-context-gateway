@@ -1051,6 +1051,26 @@ _DEFAULT_UPSTREAM_BY_STRATEGY = {
     "heuristics": "https://api.openai.com/v1",
 }
 
+# Upstream (provider) endpoints the launcher can point at. Anything not listed
+# is reachable through "custom", which asks for the base URL and key directly.
+WIZARD_UPSTREAMS = (
+    ("1", "openrouter", "OpenRouter                 https://openrouter.ai/api/v1"),
+    ("2", "openai", "OpenAI                     https://api.openai.com/v1"),
+    ("3", "groq", "Groq                       https://api.groq.com/openai/v1"),
+    ("4", "antigravity", "Google Antigravity bridge  http://127.0.0.1:8080/v1"),
+    ("5", "ollama", "Local Ollama / llama.cpp   http://127.0.0.1:11434/v1"),
+    ("6", "custom", "Other OpenAI-compatible endpoint (enter URL + key)"),
+)
+WIZARD_UPSTREAM_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "openai": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "antigravity": "http://127.0.0.1:8080/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
+}
+# Providers that authenticate with a bearer token. Local bridges do not.
+WIZARD_KEY_PROVIDERS = frozenset({"openrouter", "openai", "groq", "custom"})
+
 
 def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     """True when a local socket already owns the port."""
@@ -1094,25 +1114,48 @@ def read_env_file(path: Path) -> dict:
 
 
 def build_wizard_preset(
-    agent: str, strategy: str, port: int, existing: Optional[dict] = None
+    agent: str,
+    strategy: str,
+    port: int,
+    existing: Optional[dict] = None,
+    upstream_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    classifier_url: Optional[str] = None,
+    classifier_key: Optional[str] = None,
 ) -> dict:
-    """The `.env` values the launcher should apply. Pure and testable."""
+    """The `.env` values the launcher should apply. Pure and testable.
+
+    `upstream_url`/`api_key` let the caller point at any OpenAI-compatible
+    provider (the "choose endpoint + API" step); when they are omitted the
+    existing `.env` value wins, then the strategy's default.
+    """
     existing = existing or {}
     preset: dict = {
         "GATEWAY_HOST": "127.0.0.1",
         "GATEWAY_PORT": str(port),
         "CLASSIFIER_MODE": strategy,
     }
-    upstream = existing.get("UPSTREAM_BASE_URL") or _DEFAULT_UPSTREAM_BY_STRATEGY.get(
-        strategy, "https://api.openai.com/v1"
+    upstream = (
+        upstream_url
+        or existing.get("UPSTREAM_BASE_URL")
+        or _DEFAULT_UPSTREAM_BY_STRATEGY.get(strategy, "https://api.openai.com/v1")
     )
     preset["UPSTREAM_BASE_URL"] = upstream
-    if existing.get("UPSTREAM_API_KEY"):
-        preset["UPSTREAM_API_KEY"] = existing["UPSTREAM_API_KEY"]
+    key = api_key or existing.get("UPSTREAM_API_KEY")
+    if key:
+        preset["UPSTREAM_API_KEY"] = key
+    # The loop guard refuses 8080 by default; a local bridge genuinely lives there.
+    if "127.0.0.1:8080" in upstream or "localhost:8080" in upstream:
+        preset["ALLOW_LEGACY_UPSTREAM_PORT"] = "1"
     if strategy == "local_jev":
         preset["LOCAL_JEV_URL"] = existing.get(
             "LOCAL_JEV_URL", "http://127.0.0.1:11435/v1/chat/completions"
         )
+    if classifier_url:
+        preset["CLASSIFIER_API_URL"] = classifier_url
+        resolved = classifier_key or existing.get("CLASSIFIER_API_KEY")
+        if resolved:
+            preset["CLASSIFIER_API_KEY"] = resolved
     if agent == "claude":
         preset["ANTHROPIC_SURFACE"] = "1"
     return preset
@@ -1150,7 +1193,7 @@ def update_env_file(path: Path, updates: dict) -> Path:
 
 
 def cmd_interactive(args: argparse.Namespace) -> int:
-    """The no-argument experience: ask three questions, then launch."""
+    """The no-argument experience: choose agent, routing, provider, then launch."""
     from . import ux
 
     input_fn = getattr(args, "input_fn", None) or input
@@ -1171,12 +1214,65 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         input_fn,
     )
 
+    env_path = Path.cwd() / ".env"
+    existing = read_env_file(env_path)
+
+    # --- endpoint + API key for any provider --------------------------------
+    provider = choose(
+        "\nWhich upstream endpoint (HTTP) should requests go to?\n",
+        WIZARD_UPSTREAMS,
+        input_fn,
+    )
+    if provider == "custom":
+        default_url = existing.get("UPSTREAM_BASE_URL") or "https://api.openai.com/v1"
+        upstream_url = (
+            input_fn(f"Upstream base URL [{default_url}]: ").strip() or default_url
+        )
+    else:
+        upstream_url = WIZARD_UPSTREAM_URLS[provider]
+
+    api_key = ""
+    if provider in WIZARD_KEY_PROVIDERS:
+        existing_key = existing.get("UPSTREAM_API_KEY", "")
+        hint = " (blank keeps the existing key)" if existing_key else ""
+        api_key = input_fn(f"API key for {provider}{hint}: ").strip()
+        if not api_key and not existing_key:
+            sys.stderr.write(
+                ux.yellow(
+                    "no API key entered -- set UPSTREAM_API_KEY in .env before starting\n",
+                    stream=sys.stderr,
+                )
+            )
+
+    # `external_jev` is the one strategy that needs its own classifier endpoint.
+    classifier_url = ""
+    classifier_key = ""
+    if strategy == "external_jev":
+        default_classifier = existing.get("CLASSIFIER_API_URL", "")
+        shown = default_classifier or f"{upstream_url}/chat/completions"
+        classifier_url = (
+            input_fn(f"Classifier endpoint URL [{shown}]: ").strip()
+            or default_classifier
+            or f"{upstream_url.rstrip('/')}/chat/completions"
+        )
+        classifier_key = input_fn(
+            "Classifier API key (blank keeps the existing key): "
+        ).strip()
+
     suggested = suggest_port()
     raw = input_fn(f"Gateway port [{suggested}]: ").strip()
     port = int(raw) if raw.isdigit() else suggested
 
-    env_path = Path.cwd() / ".env"
-    preset = build_wizard_preset(agent, strategy, port, read_env_file(env_path))
+    preset = build_wizard_preset(
+        agent,
+        strategy,
+        port,
+        existing,
+        upstream_url=upstream_url,
+        api_key=api_key,
+        classifier_url=classifier_url,
+        classifier_key=classifier_key,
+    )
     update_env_file(env_path, preset)
     os.environ.update({key: str(value) for key, value in preset.items()})
 

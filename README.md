@@ -588,7 +588,7 @@ agent-gateway stats --json     # for your own dashboards
 ```bash
 pip install -e .               # puts `agent-gateway` on your PATH
 
-agent-gateway                   # no args -> guided launcher (agent, strategy, port)
+agent-gateway                   # no args -> guided launcher (agent, routing, provider, port)
 agent-gateway interactive       # the same launcher, explicitly
 agent-gateway init              # interactive setup wizard -> writes .env
 agent-gateway run claude        # gateway (auto-started) + agent in one command
@@ -607,6 +607,31 @@ The launcher writes or updates `.env`, picks a free port when `8090`/`8080` are
 occupied, starts the gateway in the background, and — if you chose an agent —
 hands off to `agent-gateway run <agent>`. It also installs the global wrapper
 below, so the next command works from any directory and any shell.
+
+**Choosing any provider.** Step 3 of the launcher asks for the upstream
+endpoint, so you are not limited to the bundled profiles:
+
+```text
+Which upstream endpoint (HTTP) should requests go to?
+  [1] OpenRouter                 https://openrouter.ai/api/v1
+  [2] OpenAI                     https://api.openai.com/v1
+  [3] Groq                       https://api.groq.com/openai/v1
+  [4] Google Antigravity bridge  http://127.0.0.1:8080/v1
+  [5] Local Ollama / llama.cpp   http://127.0.0.1:11434/v1
+  [6] Other OpenAI-compatible endpoint (enter URL + key)
+```
+
+Picking **6** asks for the base URL and API key directly, so any
+OpenAI-compatible gateway works (Together, DeepSeek, vLLM, LM Studio, a company
+proxy, …). Choosing the Antigravity bridge automatically sets
+`ALLOW_LEGACY_UPSTREAM_PORT=1`; choosing `external_jev` as the routing strategy
+also prompts for the separate classifier endpoint and key. Every value is
+written to `.env`, and can equally be set by hand:
+
+```bash
+UPSTREAM_BASE_URL=https://api.deepseek.com/v1
+UPSTREAM_API_KEY=sk-...
+```
 
 ### One command, everywhere: the global shim
 

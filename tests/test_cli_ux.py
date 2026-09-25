@@ -409,6 +409,44 @@ def test_wizard_preset_standalone_has_no_surface_flag():
     assert preset["CLASSIFIER_MODE"] == "heuristics"
 
 
+def test_wizard_lists_other_providers_and_their_endpoints():
+    kinds = {key for _n, key, _l in cli.WIZARD_UPSTREAMS}
+    assert {"openrouter", "openai", "groq", "antigravity", "ollama", "custom"} <= kinds
+    assert cli.WIZARD_UPSTREAM_URLS["groq"] == "https://api.groq.com/openai/v1"
+
+
+def test_wizard_preset_honours_a_chosen_endpoint_and_key():
+    preset = build_wizard_preset(
+        "aider",
+        "heuristics",
+        8090,
+        upstream_url="https://api.groq.com/openai/v1",
+        api_key="gsk_example",
+    )
+
+    assert preset["UPSTREAM_BASE_URL"] == "https://api.groq.com/openai/v1"
+    assert preset["UPSTREAM_API_KEY"] == "gsk_example"
+    assert "ALLOW_LEGACY_UPSTREAM_PORT" not in preset
+
+
+def test_wizard_preset_relaxes_the_loop_guard_for_a_bridge():
+    preset = build_wizard_preset(
+        "hermes", "upstream_reused", 8091,
+        upstream_url="http://127.0.0.1:8080/v1",
+    )
+    assert preset["ALLOW_LEGACY_UPSTREAM_PORT"] == "1"
+
+
+def test_wizard_preset_carries_the_external_classifier_endpoint():
+    preset = build_wizard_preset(
+        "hermes", "external_jev", 8090,
+        classifier_url="https://jev.example/v1/chat/completions",
+        classifier_key="jev-key",
+    )
+    assert preset["CLASSIFIER_API_URL"] == "https://jev.example/v1/chat/completions"
+    assert preset["CLASSIFIER_API_KEY"] == "jev-key"
+
+
 def test_update_env_file_merges_without_duplicating_keys(tmp_path):
     env = tmp_path / ".env"
     env.write_text(
@@ -445,13 +483,51 @@ def test_cmd_interactive_writes_env_from_answers(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["2", "2", ""])  # Claude Code, local_jev, default port
+    # Claude Code, local_jev, local Ollama provider, default port
+    answers = iter(["2", "2", "5", ""])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CLASSIFIER_MODE=local_jev" in text
     assert "ANTHROPIC_SURFACE=1" in text
+    assert "UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1" in text
+
+
+def test_cmd_interactive_accepts_a_custom_provider_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    # Aider, upstream_reused, custom provider, URL, key, port
+    answers = iter(["3", "3", "6", "https://my.gateway/v1", "sk-custom", ""])
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "UPSTREAM_BASE_URL=https://my.gateway/v1" in text
+    assert "UPSTREAM_API_KEY=sk-custom" in text
+
+
+def test_cmd_interactive_external_jev_prompts_for_the_classifier_endpoint(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    # Hermes, external_jev, local Ollama upstream, classifier URL, key, port
+    answers = iter(["1", "5", "5", "https://jev.example/v1", "jev-key", ""])
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "CLASSIFIER_API_URL=https://jev.example/v1" in text
+    assert "CLASSIFIER_API_KEY=jev-key" in text
 
 
 def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
@@ -465,7 +541,8 @@ def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive"])
-    answers = iter(["4", "1", ""])  # standalone, heuristics, default port
+    # standalone, heuristics, local Ollama provider, default port
+    answers = iter(["4", "1", "5", ""])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
