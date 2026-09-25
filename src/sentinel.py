@@ -110,11 +110,60 @@ class Sentinel:
         return f"http://{self.settings.host}:{self.settings.port}/health"
 
     # --- 1. watchdog -------------------------------------------------------
-    def check_health(self) -> bool:
+    def probe(self) -> Dict[str, Any]:
+        """Identify whatever is answering on the configured port.
+
+        A bare 200 is not proof that *this* gateway is up. Any service can hold
+        port 8090 -- a stale proxy, a different tool, another checkout -- and a
+        naive status check then reports healthy forever, leaving the watchdog
+        blind to the real gateway being down. So the health payload must carry
+        the gateway's own markers, including the data directory we configured.
+        """
+        info: Dict[str, Any] = {"reachable": False, "identified": False}
         try:
-            return httpx.get(self.health_url, timeout=self.health_timeout).status_code == 200
+            response = httpx.get(self.health_url, timeout=self.health_timeout)
+        except Exception as exc:
+            info["detail"] = f"unreachable: {exc}"
+            return info
+
+        info["reachable"] = True
+        info["status_code"] = response.status_code
+        if response.status_code != 200:
+            info["detail"] = f"unexpected status {response.status_code}"
+            return info
+
+        try:
+            body = response.json()
         except Exception:
-            return False
+            info["detail"] = "health endpoint did not return JSON"
+            return info
+
+        if not isinstance(body, dict):
+            info["detail"] = "health payload was not an object"
+            return info
+
+        markers = {"status", "version", "artifacts", "memory", "data_dir"}
+        missing = sorted(markers - set(body))
+        if missing:
+            info["detail"] = f"not an agent-context-gateway health payload (missing {', '.join(missing)})"
+            return info
+
+        # The data dir is the strongest available identity signal: it proves the
+        # process on this port shares *our* configuration, not just our routes.
+        if str(body.get("data_dir") or "") != str(self.settings.data_dir):
+            info["detail"] = (
+                f"data_dir mismatch: port serves {body.get('data_dir')!r}, "
+                f"expected {str(self.settings.data_dir)!r}"
+            )
+            return info
+
+        info["identified"] = True
+        info["version"] = body.get("version")
+        return info
+
+    def check_health(self) -> bool:
+        """True only for a health payload we can positively identify as ours."""
+        return bool(self.probe()["identified"])
 
     def spawn_gateway(self) -> bool:
         """Respawn the gateway detached, inheriting this process's environment."""
@@ -173,19 +222,31 @@ class Sentinel:
 
     # --- cycle -------------------------------------------------------------
     def run_cycle(self, status_only: bool = False) -> Dict[str, Any]:
+        probe = self.probe()
         report: Dict[str, Any] = {
             "ts": int(time.time()),
             "health_url": self.health_url,
-            "gateway_healthy": self.check_health(),
+            "gateway_healthy": probe["identified"],
+            "gateway_reachable": probe["reachable"],
         }
+        if not probe["identified"]:
+            if probe.get("detail"):
+                report["health_detail"] = probe["detail"]
+            if probe["reachable"]:
+                # Something else owns the port. Flagging it here -- including on
+                # the read-only path -- is what makes `--status` actionable.
+                report["foreign_service_on_port"] = True
 
         if status_only:
             report["shm_dir"] = str(self.settings.shm_cache_dir)
             report["db_path"] = str(self.settings.db_path)
             return report
 
-        if not report["gateway_healthy"]:
-            report["respawned"] = self.spawn_gateway()
+        if not probe["identified"]:
+            # Respawning cannot win a bind against a live foreign service, so do
+            # not churn a doomed process on every cycle; spawn only when the port
+            # is genuinely free.
+            report["respawned"] = False if probe["reachable"] else self.spawn_gateway()
 
         try:
             report["artifacts"] = self.store.prune(

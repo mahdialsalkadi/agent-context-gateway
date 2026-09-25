@@ -96,6 +96,11 @@ These are enforced by the test suite, not just documented:
 4. **No full-response buffering.** Streaming is chunk-in/chunk-out. The escape
    look-ahead is bounded and exits as soon as the opening characters cannot be
    the sentinel.
+5. **The watchdog verifies identity, not reachability.** A bare HTTP 200 on the
+   port only proves *something* is listening. `sentinel.probe()` requires the
+   health payload to carry the gateway's own markers and to report the same
+   `DATA_DIR`; anything else is surfaced as `foreign_service_on_port` rather
+   than silently accepted as healthy.
 
 ---
 
@@ -129,6 +134,13 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yml up --build
 curl -s http://127.0.0.1:8090/health
 ```
+
+`.env` is optional: the compose file loads it only when it exists, so a fresh
+clone validates and starts without it (`UPSTREAM_BASE_URL=... docker compose
+-f docker/docker-compose.yml up --build` works too). The container runs as a
+non-root user, publishes the port on loopback only, and gets a 256MB tmpfs at
+`/dev/shm` for the spillover cache — the Docker default of 64MB sits below the
+eviction ceiling and would churn.
 
 ### Try it with zero credentials
 
@@ -327,12 +339,13 @@ pytest tests/ -v
 ```
 
 ```text
-168 passed
+180 passed
 ```
 
 The suite is **fully offline**: `tests/mock_upstream.py` provides both a real
 local HTTP server and an in-process `httpx.MockTransport`, so no API keys, no
-network and no spend. Coverage highlights:
+network and no spend. `tests/conftest.py` wires the fixtures together;
+`tests/test_sentinel.py` covers the watchdog. Coverage highlights:
 
 | Area | What is asserted |
 | --- | --- |
@@ -343,6 +356,7 @@ network and no spend. Coverage highlights:
 | Memory concurrency | **50 concurrent writers** in WAL mode with zero `database is locked` |
 | Memory lifecycle | Ebbinghaus curve, `N ≥ 3` graduation, conflict overwrite, compaction + `VACUUM` |
 | Anthropic bridge | Request/response/SSE translation, tool_use streaming, forced `tool_choice`, `count_tokens` |
+| Watchdog identity | A 200 from a *foreign* service on the port is rejected, so the sentinel cannot be fooled into reporting a dead gateway as healthy |
 | Invariants | Loop guard, fail-open classification, unknown-field passthrough, no secret leakage in `/health` |
 
 ---
@@ -374,6 +388,11 @@ Documented rather than hidden:
   precision over recall: it will miss facts rather than invent them.
 - **The classifier is optional by design.** With it disabled, ambiguous prompts
   keep their tools, which is correct but less token-efficient.
+- **The port is exclusive.** If another service already holds `GATEWAY_PORT`
+  (a previous proxy, another checkout), the gateway cannot bind. The sentinel
+  reports this as `foreign_service_on_port: true` and deliberately does *not*
+  respawn, because a second process cannot win the bind either. Change
+  `GATEWAY_PORT` to resolve it.
 - The SQLite graph is single-node. There is no multi-process coordination beyond
   WAL.
 

@@ -20,9 +20,12 @@ services:
     image: agent-context-gateway:0.1.0
     container_name: agent-context-gateway
 
-    # Secrets and tuning come from .env, which is gitignored.
+    # Secrets and tuning come from .env, which is gitignored. Optional on
+    # purpose: a fresh clone has only .env.example, and a required file here
+    # would make `docker compose config` fail before the user ever runs it.
     env_file:
-      - ../.env
+      - path: ../.env
+        required: false
 
     environment:
       GATEWAY_HOST: 0.0.0.0
