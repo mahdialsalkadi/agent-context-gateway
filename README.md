@@ -15,6 +15,14 @@ Works with **Claude Code, Aider, Cursor, Codex/Copilot bridges, Google
 Antigravity, Hermes, or any OpenAI SDK client** — no vendor lock-in, no
 agent-specific code, no hardcoded paths.
 
+**Designed for flat-rate subscriptions and offline models.** The primary job is
+not to route to per-token APIs — it is to sit in front of the plan you already
+pay for (Google One Pro via the Antigravity bridge, a Claude Code login, a local
+GGUF) and stop tool leakage, so a 5-hour message limit is spent on real work
+instead of on tool schemas the model never needed. Every pruned schema is quota
+you did not burn, and hitting the hourly limit without buying external API
+tokens is the point.
+
 **And it can run for $0.** Every routing decision is available in a mode that
 reuses a subscription you already pay for, or a model already running on your
 own machine — no second provider, no second key. See
@@ -399,8 +407,8 @@ for the annotated template.
 | `DATA_DIR` | `~/.agent-gateway/data` | SQLite graph lives here |
 | `LOG_DIR` | `~/.agent-gateway/logs` | Audit log, rotated logs, lock file |
 | `SHM_CACHE_DIR` | `/dev/shm/agent_gateway` (falls back to `/tmp/agent_gateway`) | Spilled context |
-| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint |
-| `UPSTREAM_API_KEY` | — | Falls back to `OPENAI_API_KEY`, `OPENROUTER_API_KEY` |
+| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint; a localhost bridge or engine is detected as a free tier |
+| `UPSTREAM_API_KEY` | — | Falls back to `OPENAI_API_KEY`, `OPENROUTER_API_KEY`. Absent or `dummy` forwards the client's own `Authorization` upstream (subscription bridges) |
 | `GATEWAY_API_KEY` | unset | When set, clients must authenticate |
 
 ### Classifier modes
@@ -553,6 +561,7 @@ headers, and `tools_before` / `tools_after` / `selective_dropped` in the audit l
 ```text
 agent-context-gateway -- savings dashboard
 ==============================================================
+  connection       [SUBSCRIPTION BRIDGE: Google Antigravity (Google One Pro)]
   audit source     ~/.agent-gateway/logs/audit.log
 
   requests         3        sessions        1
@@ -561,6 +570,9 @@ agent-context-gateway -- savings dashboard
   routes
     Classifier-FailOpen                     2  ########################
     FastPath-Keep                           1  ############............
+
+  quota preserved (the point of the gateway)
+    rate-limit quota saved     85.0%   (4 of 25 tools forwarded)
 
   estimated savings (see note)
     tool schemas pruned        4,960 tokens   (62 selective drops)
@@ -608,30 +620,46 @@ occupied, starts the gateway in the background, and — if you chose an agent �
 hands off to `agent-gateway run <agent>`. It also installs the global wrapper
 below, so the next command works from any directory and any shell.
 
-**Choosing any provider.** Step 3 of the launcher asks for the upstream
-endpoint, so you are not limited to the bundled profiles:
+**Choosing where requests go.** Step 3 of the launcher is grouped into the two
+tiers that matter: flat-rate subscriptions and local engines (no API key — the
+reason the gateway exists), and metered APIs (which ask for a key):
 
 ```text
-Which upstream endpoint (HTTP) should requests go to?
-  [1] OpenRouter                 https://openrouter.ai/api/v1
-  [2] OpenAI                     https://api.openai.com/v1
-  [3] Groq                       https://api.groq.com/openai/v1
-  [4] Google Antigravity bridge  http://127.0.0.1:8080/v1
-  [5] Local Ollama / llama.cpp   http://127.0.0.1:11434/v1
-  [6] Other OpenAI-compatible endpoint (enter URL + key)
+Where should requests go upstream?
+  -- $0 per token: flat-rate subscriptions & local engines (no API key) --
+  [1] Google Antigravity bridge   (Google One Pro / free)  http://127.0.0.1:8080/v1
+  [2] Claude Code official session (Anthropic surface, forwards your login)
+  [3] Fully local offline engine  (llama-server / Ollama / Vulkan)
+  -- paid: metered per-token APIs (asks for an API key) --
+  [4] Commercial pay-per-token API (OpenRouter, OpenAI, Groq, custom URL)
 ```
 
-Picking **6** asks for the base URL and API key directly, so any
-OpenAI-compatible gateway works (Together, DeepSeek, vLLM, LM Studio, a company
-proxy, …). Choosing the Antigravity bridge automatically sets
-`ALLOW_LEGACY_UPSTREAM_PORT=1`; choosing `external_jev` as the routing strategy
-also prompts for the separate classifier endpoint and key. Every value is
-written to `.env`, and can equally be set by hand:
+Options **1–3 never prompt for an API key.** They forward the client's own
+subscription session upstream (see [Auth passthrough](#auth-passthrough-and-the-free-tiers))
+and write `UPSTREAM_API_KEY=dummy` only so that agents which demand a non-empty
+key still start. Option **1** also sets `ALLOW_LEGACY_UPSTREAM_PORT=1` because
+the Antigravity bridge genuinely lives on `:8080`. Option **4** opens a second
+menu (OpenRouter / OpenAI / Groq / custom URL); *custom* takes any base URL and
+key, so Together, DeepSeek, vLLM, LM Studio or a company proxy all work. Choosing
+`external_jev` as the routing strategy additionally prompts for its own
+classifier endpoint and key. Every value is written to `.env`, and can equally
+be set by hand:
 
 ```bash
 UPSTREAM_BASE_URL=https://api.deepseek.com/v1
 UPSTREAM_API_KEY=sk-...
 ```
+
+### Auth passthrough and the free tiers
+
+The gateway injects its own `UPSTREAM_API_KEY` when it has one — the agent never
+learns the real credential. When the key is absent **or a placeholder** (`dummy`,
+`none`, `changeme`, …), the upstream is treated as a subscription bridge or local
+engine and the **client's own `Authorization` header is forwarded verbatim**, so
+an Antigravity token or a Claude Code session arrives intact. A value that
+equals `GATEWAY_API_KEY` is never forwarded: that credential authenticates the
+client to *this gateway*, not to the upstream. `x-api-key` (Claude Code) is
+forwarded too, as a bearer token.
 
 ### One command, everywhere: the global shim
 
@@ -758,7 +786,7 @@ pytest tests/ -v
 ```
 
 ```text
-332 passed
+380 passed
 ```
 
 The suite is **fully offline**: `tests/mock_upstream.py` provides both a real
@@ -798,8 +826,11 @@ highlights:
 
 - **`.env` is gitignored**, along with `*.db`, `*.db-wal`, `*.db-shm`, `*.log`,
   `.venv/` and `__pycache__/`.
-- The gateway **never forwards the client's `Authorization` header**; it injects
-  the upstream credential itself.
+- The gateway **injects its own upstream credential** when `UPSTREAM_API_KEY` is
+  a real key, so the agent never learns it. With no key (a subscription bridge or
+  local engine) it forwards the client's own `Authorization`/`x-api-key` header
+  instead — that is what lets your existing session reach the upstream. It never
+  forwards `GATEWAY_API_KEY` upstream.
 - `/health` returns a **redacted** snapshot — presence booleans, never values.
 - Bind to `127.0.0.1` unless you also set `GATEWAY_API_KEY`. The Docker compose
   file publishes on loopback only for the same reason.

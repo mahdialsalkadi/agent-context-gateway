@@ -89,6 +89,11 @@ class Savings:
     artifact_chars: int = 0
     selective_drops: int = 0
     escaped_replays: int = 0
+    # Raw tool counts, so the dashboard can say what fraction of the schema the
+    # upstream never had to read. This is the number that matters to a flat-rate
+    # plan: it is quota *not spent*, not money not paid.
+    tools_before_total: int = 0
+    tools_after_total: int = 0
 
     @property
     def artifact_tokens(self) -> int:
@@ -101,6 +106,14 @@ class Savings:
     @property
     def usd(self) -> float:
         return self.total_tokens / 1_000_000 * BENCHMARK_USD_PER_MTOKEN
+
+    @property
+    def tool_reduction_pct(self) -> float:
+        """Share of the offered tool schema the upstream never had to read."""
+        if self.tools_before_total <= 0:
+            return 0.0
+        dropped = self.tools_before_total - self.tools_after_total
+        return max(0.0, min(100.0, dropped / self.tools_before_total * 100.0))
 
 
 @dataclass
@@ -146,6 +159,9 @@ class Stats:
             "spilled_chars": self.savings.artifact_chars,
             "selective_drops": self.savings.selective_drops,
             "escape_replays": self.savings.escaped_replays,
+            "tools_offered": self.savings.tools_before_total,
+            "tools_forwarded": self.savings.tools_after_total,
+            "quota_preserved_pct": round(self.savings.tool_reduction_pct, 1),
             "estimated_tokens_saved": self.savings.total_tokens,
             "estimated_usd_saved": round(self.savings.usd, 4),
             "benchmark_usd_per_mtoken": BENCHMARK_USD_PER_MTOKEN,
@@ -249,6 +265,8 @@ class Analytics:
                     dropped * (TOOL_SCHEMA_OVERHEAD_TOKENS + 2 * TOKENS_PER_TOOL_PROPERTY)
                 )
             savings.selective_drops += int(entry.get("selective_dropped") or 0)
+            savings.tools_before_total += max(0, int(tools_before))
+            savings.tools_after_total += max(0, int(tools_after))
 
         # Spilled artifact bodies: the gateway records the characters it did
         # not send in `spilled_chars`; older rows fall back to the observed
@@ -270,7 +288,9 @@ def _bar(value: float, maximum: float, width: int = 24) -> str:
     return "#" * filled + "." * (width - filled)
 
 
-def render_table(stats: Stats, source: str) -> str:
+def render_table(
+    stats: Stats, source: str, connection: Optional[Dict[str, str]] = None
+) -> str:
     """Plain-text dashboard. ASCII only, so it renders over any SSH session."""
     data = stats.as_dict()
     savings = stats.savings
@@ -282,6 +302,8 @@ def render_table(stats: Stats, source: str) -> str:
     add = lines.append
     add("agent-context-gateway -- savings dashboard")
     add("=" * 62)
+    if connection:
+        add(f"  connection       [{connection.get('label', connection.get('tier', '?'))}]")
     add(f"  audit source     {source}")
     if data["window"]["first_ts"]:
         add(
@@ -297,6 +319,12 @@ def render_table(stats: Stats, source: str) -> str:
         add(f"    {route:<34} {count:>6}  {_bar(count, max_route)}")
     if len(routes) > len(top_routes):
         add(f"    ... and {len(routes) - len(top_routes)} more")
+    add("")
+    add("  quota preserved (the point of the gateway)")
+    add(
+        f"    rate-limit quota saved   {data['quota_preserved_pct']:>6.1f}%"
+        f"   ({savings.tools_after_total:,} of {savings.tools_before_total:,} tools forwarded)"
+    )
     add("")
     add("  estimated savings (see note)")
     add(
@@ -325,12 +353,18 @@ def render_live(stats_source, interval: float = 2.0) -> None:
     """Re-render the dashboard in place until Ctrl-C.
 
     `stats_source` is a zero-argument callable returning (Stats, source_label),
-    so live mode re-reads the log each frame and shows fresh numbers.
+    optionally with a third connection-tier mapping, so live mode re-reads the
+    log each frame and shows fresh numbers.
     """
     try:
         while True:
-            stats, source = stats_source()
-            frame = render_table(stats, source)
+            frame_source = stats_source()
+            if len(frame_source) == 3:
+                stats, source, connection = frame_source
+            else:
+                stats, source = frame_source
+                connection = None
+            frame = render_table(stats, source, connection)
             print("\033[2J\033[H" + frame, flush=True)
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -357,14 +391,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     analytics = Analytics(path)
 
     if args.live:
-        render_live(lambda: (analytics.compute(), str(path)), args.interval)
+        render_live(
+            lambda: (analytics.compute(), str(path), settings.connection), args.interval
+        )
         return 0
 
     stats = analytics.compute()
     if args.json:
-        print(json.dumps(stats.as_dict(), indent=2))
+        payload = stats.as_dict()
+        payload["connection"] = settings.connection
+        print(json.dumps(payload, indent=2))
     else:
-        print(render_table(stats, str(path)))
+        print(render_table(stats, str(path), settings.connection))
     return 0
 
 

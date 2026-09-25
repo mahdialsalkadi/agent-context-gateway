@@ -409,10 +409,44 @@ def test_wizard_preset_standalone_has_no_surface_flag():
     assert preset["CLASSIFIER_MODE"] == "heuristics"
 
 
-def test_wizard_lists_other_providers_and_their_endpoints():
-    kinds = {key for _n, key, _l in cli.WIZARD_UPSTREAMS}
-    assert {"openrouter", "openai", "groq", "antigravity", "ollama", "custom"} <= kinds
+def test_wizard_puts_flat_rate_subscriptions_first():
+    kinds = [key for _n, key, _l in cli.WIZARD_UPSTREAMS]
+
+    # The free tier is the reason the gateway exists, and it is option 1.
+    assert kinds[0] == "antigravity"
+    assert kinds[:3] == ["antigravity", "claude_session", "local"]
+    assert kinds[-1] == "commercial"
+    assert set(kinds) == {"antigravity", "claude_session", "local", "commercial"}
+
+    # The commercial sub-menu still reaches every metered endpoint.
+    commercial = {key for _n, key, _l in cli.WIZARD_COMMERCIAL}
+    assert {"openrouter", "openai", "groq", "custom"} <= commercial
     assert cli.WIZARD_UPSTREAM_URLS["groq"] == "https://api.groq.com/openai/v1"
+
+    # Tier 1 is exactly the keyless tier, and it never overlaps the keyed one.
+    assert cli.WIZARD_SUBSCRIPTION_PROVIDERS == {"antigravity", "claude_session", "local"}
+    assert not (cli.WIZARD_SUBSCRIPTION_PROVIDERS & cli.WIZARD_KEY_PROVIDERS)
+
+
+def test_wizard_preset_antigravity_is_keyless_and_relaxes_the_loop_guard():
+    preset = build_wizard_preset(
+        "hermes",
+        "upstream_reused",
+        8091,
+        upstream_url=cli.WIZARD_UPSTREAM_URLS["antigravity"],
+        api_key=cli.WIZARD_PLACEHOLDER_KEY,
+    )
+
+    assert preset["UPSTREAM_BASE_URL"] == "http://127.0.0.1:8080/v1"
+    assert preset["ALLOW_LEGACY_UPSTREAM_PORT"] == "1"
+    assert preset["UPSTREAM_API_KEY"] == "dummy"
+
+
+def test_wizard_preset_claude_session_marks_the_anthropic_surface():
+    preset = build_wizard_preset(
+        "hermes", "heuristics", 8090, anthropic_surface=True
+    )
+    assert preset["ANTHROPIC_SURFACE"] == "1"
 
 
 def test_wizard_preset_honours_a_chosen_endpoint_and_key():
@@ -483,8 +517,8 @@ def test_cmd_interactive_writes_env_from_answers(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Claude Code, local_jev, local Ollama provider, default port
-    answers = iter(["2", "2", "5", ""])
+    # Claude Code, local_jev, local engine, its base URL, default port
+    answers = iter(["2", "2", "3", "", ""])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -501,8 +535,8 @@ def test_cmd_interactive_accepts_a_custom_provider_endpoint(tmp_path, monkeypatc
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Aider, upstream_reused, custom provider, URL, key, port
-    answers = iter(["3", "3", "6", "https://my.gateway/v1", "sk-custom", ""])
+    # Aider, upstream_reused, commercial tier, custom provider, URL, key, port
+    answers = iter(["3", "3", "4", "4", "https://my.gateway/v1", "sk-custom", ""])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -520,14 +554,64 @@ def test_cmd_interactive_external_jev_prompts_for_the_classifier_endpoint(
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Hermes, external_jev, local Ollama upstream, classifier URL, key, port
-    answers = iter(["1", "5", "5", "https://jev.example/v1", "jev-key", ""])
+    # Hermes, external_jev, Antigravity (keyless, no URL/key prompt), then the
+    # dedicated classifier endpoint, its key, and the port.
+    answers = iter(["1", "5", "1", "https://jev.example/v1", "jev-key", ""])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CLASSIFIER_API_URL=https://jev.example/v1" in text
     assert "CLASSIFIER_API_KEY=jev-key" in text
+
+
+def test_cmd_interactive_subscription_bridge_never_prompts_for_a_key(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    prompts = []
+    answers = iter(["1", "1", "1", ""])  # Hermes, heuristics, Antigravity, port
+
+    def fake_input(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    args.input_fn = fake_input
+
+    assert cmd_interactive(args) == 0
+    assert not any("api key" in p.lower() for p in prompts), prompts
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "UPSTREAM_BASE_URL=http://127.0.0.1:8080/v1" in text
+    assert "ALLOW_LEGACY_UPSTREAM_PORT=1" in text
+    assert "UPSTREAM_API_KEY=dummy" in text, "a placeholder satisfies strict clients"
+
+
+def test_cmd_interactive_local_engine_never_prompts_for_a_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    prompts = []
+    # Hermes, heuristics, local engine, its base URL, port
+    answers = iter(["1", "1", "3", "", ""])
+
+    def fake_input(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    args.input_fn = fake_input
+
+    assert cmd_interactive(args) == 0
+    assert not any("api key" in p.lower() for p in prompts), prompts
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "UPSTREAM_API_KEY=dummy" in text
 
 
 def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
@@ -541,8 +625,8 @@ def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive"])
-    # standalone, heuristics, local Ollama provider, default port
-    answers = iter(["4", "1", "5", ""])
+    # standalone, heuristics, local engine, its base URL, default port
+    answers = iter(["4", "1", "3", "", ""])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0

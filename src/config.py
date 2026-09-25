@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 # ------------------------------------------------------------------------------
 # Defaults
@@ -84,6 +84,55 @@ ESCAPE_INSTRUCTION = (
 
 # Ports a gateway is most likely to be listening on. Used by the loop guard.
 LEGACY_PROXY_PORTS = (8080, 8090)
+
+# ------------------------------------------------------------------------------
+# Connection tiers
+# ------------------------------------------------------------------------------
+# The gateway is a customs checkpoint for FLAT-RATE subscriptions, not a router
+# for pay-per-token APIs. The upstream tells us which tier is in force, and
+# `stats` / the dashboard say so plainly: "quota preserved" means different
+# things to a Google One Pro plan than to a metered invoice.
+TIER_SUBSCRIPTION = "subscription"
+TIER_LOCAL = "local"
+TIER_COMMERCIAL = "commercial"
+
+# Local ports whose owner is a known subscription bridge. Traffic here rides a
+# plan the user already pays for, so pruning protects an hourly quota.
+_BRIDGE_PORTS: Dict[int, str] = {
+    8080: "Google Antigravity (Google One Pro)",
+    4141: "GitHub Copilot bridge",
+}
+# Local ports whose owner is an offline engine: no plan, no quota, no key.
+_LOCAL_ENGINE_PORTS: Dict[int, str] = {
+    11434: "Ollama",
+    11435: "llama.cpp (local Jev)",
+}
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"})
+
+
+def classify_upstream(url: Optional[str]) -> Tuple[str, str]:
+    """(tier, label) for an upstream URL. Pure, so the UI can be tested alone.
+
+    A localhost upstream is never billed per token, so it is either a
+    subscription bridge (an hourly quota worth protecting) or a local engine
+    (nothing to protect, but still zero cost). Everything else is a metered API.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(sanitize_url(url or ""))
+    except ValueError:
+        return TIER_COMMERCIAL, "COMMERCIAL API (metered)"
+    host = (parsed.hostname or "").lower()
+    local = host in _LOCAL_HOSTS or host.endswith(".local")
+    if not local:
+        return TIER_COMMERCIAL, "COMMERCIAL API (metered)"
+    port = parsed.port
+    if port in _BRIDGE_PORTS:
+        return TIER_SUBSCRIPTION, f"SUBSCRIPTION BRIDGE: {_BRIDGE_PORTS[port]}"
+    if port in _LOCAL_ENGINE_PORTS:
+        return TIER_LOCAL, f"LOCAL OFFLINE: {_LOCAL_ENGINE_PORTS[port]}"
+    return TIER_LOCAL, f"LOCAL BRIDGE: {host}:{port if port else '-'}"
 
 
 # ------------------------------------------------------------------------------
@@ -323,6 +372,12 @@ class Settings:
         return f"{self.host}:{self.port}"
 
     @property
+    def connection(self) -> Dict[str, str]:
+        """The upstream's connection tier, for `stats`, `/health` and the UI."""
+        tier, label = classify_upstream(self.upstream_base_url)
+        return {"tier": tier, "label": label, "upstream": self.upstream_base_url}
+
+    @property
     def effective_classifier_mode(self) -> str:
         """The mode actually in force, resolving `auto` from the environment.
 
@@ -399,6 +454,7 @@ class Settings:
             "listen": self.label,
             "upstream": self.upstream_base_url,
             "upstream_key": bool(self.upstream_api_key),
+            "connection": self.connection,
             "gateway_auth": bool(self.gateway_api_key),
             "classifier_enabled": self.classifier_enabled,
             "classifier_mode": self.effective_classifier_mode,

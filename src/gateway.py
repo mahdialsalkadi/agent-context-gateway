@@ -72,6 +72,55 @@ from .memory import GraphMemory, get_memory
 from .messages import last_user_text, normalize_messages, text_of
 
 # ------------------------------------------------------------------------------
+# Upstream auth
+# ------------------------------------------------------------------------------
+# Values that mean "no real credential of our own". A flat-rate subscription
+# bridge (Antigravity, a Claude Code session) or a local engine authenticates the
+# *client's* session, so the gateway must forward the client's Authorization
+# header verbatim instead of replacing it with a placeholder bearer token.
+_PLACEHOLDER_UPSTREAM_KEYS = frozenset(
+    {"", "dummy", "none", "null", "changeme", "replace_me", "placeholder"}
+)
+
+
+def upstream_auth_header(api_key: str, client_auth: str = "") -> str:
+    """The `Authorization` value to send upstream, or "" for none.
+
+    A real `UPSTREAM_API_KEY` always wins: the gateway owns the credential and
+    injects it, so the agent never learns it. A placeholder (or absent) key means
+    the upstream rides the client's own subscription session, so the client's
+    header is forwarded untouched -- that is the whole point of bridging. As a
+    last resort the placeholder itself is re-sent, so an upstream that insists on
+    a non-empty bearer still gets one.
+    """
+    key = (api_key or "").strip()
+    if key and key.lower() not in _PLACEHOLDER_UPSTREAM_KEYS:
+        return f"Bearer {key}"
+    if client_auth:
+        return client_auth
+    return f"Bearer {key}" if key else ""
+
+
+def client_upstream_auth(request: Request, gateway_api_key: str = "") -> str:
+    """The client's own credential, for bridging a subscription session.
+
+    Claude Code sends its session token as a bearer *and* as `x-api-key`; either
+    is forwarded. A credential that matches `GATEWAY_API_KEY` authenticates the
+    client to *this* gateway, not to the upstream, so it is never leaked.
+    """
+    header = (request.headers.get("authorization") or "").strip()
+    if not header:
+        token = (request.headers.get("x-api-key") or "").strip()
+        header = f"Bearer {token}" if token else ""
+    if not header:
+        return ""
+    presented = header[7:].strip() if header.lower().startswith("bearer ") else header
+    if gateway_api_key and presented == gateway_api_key:
+        return ""
+    return header
+
+
+# ------------------------------------------------------------------------------
 # Streaming helpers
 # ------------------------------------------------------------------------------
 class SSETap:
@@ -324,10 +373,13 @@ def create_app(
             headers["X-Proxy-Tools-After"] = str(after)
         return headers
 
-    def upstream_request(client: httpx.AsyncClient, body: Dict[str, Any]) -> httpx.Request:
+    def upstream_request(
+        client: httpx.AsyncClient, body: Dict[str, Any], client_auth: str = ""
+    ) -> httpx.Request:
         headers = {"Content-Type": "application/json"}
-        if cfg().upstream_api_key:
-            headers["Authorization"] = f"Bearer {cfg().upstream_api_key}"
+        auth = upstream_auth_header(cfg().upstream_api_key, client_auth)
+        if auth:
+            headers["Authorization"] = auth
         return client.build_request(
             "POST", f"{cfg().upstream_base_url}/chat/completions", json=body, headers=headers
         )
@@ -387,12 +439,15 @@ def create_app(
         return payload
 
     @app.get("/v1/models")
-    async def list_models():
+    async def list_models(request: Request):
         client = upstream_client()
         try:
             headers = {}
-            if cfg().upstream_api_key:
-                headers["Authorization"] = f"Bearer {cfg().upstream_api_key}"
+            auth = upstream_auth_header(
+                cfg().upstream_api_key, client_upstream_auth(request, cfg().gateway_api_key)
+            )
+            if auth:
+                headers["Authorization"] = auth
             response = await client.get(f"{cfg().upstream_base_url}/models", headers=headers)
             return JSONResponse(response.json(), status_code=response.status_code)
         except Exception as exc:
@@ -416,6 +471,9 @@ def create_app(
             return openai_error("Request body must be a JSON object.", 400)
 
         bypass = request.headers.get("x-agent-gateway-bypass", "").lower() == "true"
+        # The client's own credential, for forwarding a subscription session
+        # upstream when we have no key of our own to inject.
+        client_auth = client_upstream_auth(request, cfg().gateway_api_key)
 
         session_id = (
             request.headers.get("x-session-id")
@@ -435,7 +493,9 @@ def create_app(
         if bypass:
             client = upstream_client()
             try:
-                upstream = await client.send(upstream_request(client, body), stream=True)
+                upstream = await client.send(
+                    upstream_request(client, body, client_auth), stream=True
+                )
             except Exception as exc:
                 await _close_quietly(None, client)
                 return openai_error(f"Upstream unreachable: {exc}", 502, "upstream_error")
@@ -535,7 +595,9 @@ def create_app(
         # 5. Dispatch.
         client = upstream_client()
         try:
-            upstream = await client.send(upstream_request(client, body), stream=True)
+            upstream = await client.send(
+                upstream_request(client, body, client_auth), stream=True
+            )
         except Exception as exc:
             await _close_quietly(None, client)
             elapsed = (time.perf_counter() - started) * 1000
@@ -604,7 +666,7 @@ def create_app(
 
                 try:
                     upstream = await client.send(
-                        upstream_request(client, body), stream=True
+                        upstream_request(client, body, client_auth), stream=True
                     )
                 except Exception as exc:
                     await _close_quietly(None, client)
@@ -746,9 +808,10 @@ def create_app(
             inject_escape_instruction(normalize_messages(translated))
 
         client = upstream_client()
+        client_auth = client_upstream_auth(request, cfg().gateway_api_key)
         try:
             upstream = await client.send(
-                upstream_request(client, translated), stream=streaming
+                upstream_request(client, translated, client_auth), stream=streaming
             )
         except Exception as exc:
             await _close_quietly(None, client)
@@ -843,7 +906,9 @@ def create_app(
     async def dashboard_stats():
         from .analytics import Analytics
 
-        return JSONResponse(stats_payload(Analytics(cfg().audit_log_path)))
+        return JSONResponse(
+            stats_payload(Analytics(cfg().audit_log_path), connection=cfg().connection)
+        )
 
     @app.get("/ui/api/profile", include_in_schema=False)
     async def dashboard_profile():

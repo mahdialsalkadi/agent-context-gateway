@@ -19,7 +19,13 @@ from src.analytics import (
     percentile,
     render_table,
 )
-from src.config import load_settings
+from src.config import (
+    TIER_COMMERCIAL,
+    TIER_LOCAL,
+    TIER_SUBSCRIPTION,
+    classify_upstream,
+    load_settings,
+)
 
 
 def write_audit(path, entries):
@@ -225,6 +231,39 @@ def test_zero_savings_when_nothing_was_pruned(tmp_path):
 # ------------------------------------------------------------------------------
 # Rendering
 # ------------------------------------------------------------------------------
+def test_render_table_shows_the_connection_tier_and_quota(tmp_path):
+    log = tmp_path / "audit.log"
+    write_audit(log, [entry(tools_before=20, tools_after=4)])
+
+    text = render_table(
+        Analytics(log).compute(),
+        str(log),
+        {"tier": "subscription", "label": "SUBSCRIPTION BRIDGE: Google Antigravity"},
+    )
+
+    assert "SUBSCRIPTION BRIDGE" in text
+    assert "quota saved" in text
+    assert "80.0%" in text, "20 offered, 4 forwarded => 80% kept out of the prompt"
+    text.encode("ascii")
+
+
+def test_quota_preserved_is_zero_without_tool_traffic(tmp_path):
+    log = tmp_path / "audit.log"
+    write_audit(log, [entry()])
+
+    data = Analytics(log).compute().as_dict()
+    assert data["quota_preserved_pct"] == 0.0
+    assert data["tools_offered"] == 0
+
+
+def test_classify_upstream_identifies_the_connection_tier():
+    assert classify_upstream("http://127.0.0.1:8080/v1")[0] == TIER_SUBSCRIPTION
+    assert classify_upstream("http://127.0.0.1:11434/v1")[0] == TIER_LOCAL
+    assert classify_upstream("https://api.openai.com/v1")[0] == TIER_COMMERCIAL
+    assert classify_upstream("https://openrouter.ai/api/v1")[0] == TIER_COMMERCIAL
+    assert "Antigravity" in classify_upstream("http://127.0.0.1:8080/v1")[1]
+
+
 def test_render_table_is_ascii_and_mentions_the_estimate(tmp_path):
     log = tmp_path / "audit.log"
     write_audit(log, [entry(tools_before=20, tools_after=0, spilled_chars=8000)])

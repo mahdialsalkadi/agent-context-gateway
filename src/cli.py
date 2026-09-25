@@ -1051,25 +1051,101 @@ _DEFAULT_UPSTREAM_BY_STRATEGY = {
     "heuristics": "https://api.openai.com/v1",
 }
 
-# Upstream (provider) endpoints the launcher can point at. Anything not listed
-# is reachable through "custom", which asks for the base URL and key directly.
-WIZARD_UPSTREAMS = (
+# Upstream (provider) endpoints, split by what they cost you. Tier 1 is the
+# reason this gateway exists: flat-rate subscriptions and local engines you have
+# already paid for, where every schema the upstream never reads is an hourly
+# message limit you did not spend. Tier 2 is the paid escape hatch, and the only
+# place an API key is ever requested.
+WIZARD_SUBSCRIPTION_UPSTREAMS = (
+    (
+        "1",
+        "antigravity",
+        "Google Antigravity bridge   (Google One Pro / free)  http://127.0.0.1:8080/v1",
+    ),
+    (
+        "2",
+        "claude_session",
+        "Claude Code official session (Anthropic surface, forwards your login)",
+    ),
+    (
+        "3",
+        "local",
+        "Fully local offline engine  (llama-server / Ollama / Vulkan)",
+    ),
+)
+WIZARD_COMMERCIAL_UPSTREAMS = (
+    ("4", "commercial", "Commercial pay-per-token API (OpenRouter, OpenAI, Groq, custom URL)"),
+)
+WIZARD_UPSTREAMS = WIZARD_SUBSCRIPTION_UPSTREAMS + WIZARD_COMMERCIAL_UPSTREAMS
+
+# The commercial sub-menu, reached only from option 4.
+WIZARD_COMMERCIAL = (
     ("1", "openrouter", "OpenRouter                 https://openrouter.ai/api/v1"),
     ("2", "openai", "OpenAI                     https://api.openai.com/v1"),
     ("3", "groq", "Groq                       https://api.groq.com/openai/v1"),
-    ("4", "antigravity", "Google Antigravity bridge  http://127.0.0.1:8080/v1"),
-    ("5", "ollama", "Local Ollama / llama.cpp   http://127.0.0.1:11434/v1"),
-    ("6", "custom", "Other OpenAI-compatible endpoint (enter URL + key)"),
+    ("4", "custom", "Other OpenAI-compatible endpoint (enter URL + key)"),
 )
+# Tier 1 authenticates with the client's own subscription session, never a key
+# of ours -- so the launcher must not prompt for one.
+WIZARD_SUBSCRIPTION_PROVIDERS = frozenset({"antigravity", "claude_session", "local"})
+# Tier 2 is the only tier that asks for a bearer token.
+WIZARD_KEY_PROVIDERS = frozenset({"openrouter", "openai", "groq", "custom"})
+
 WIZARD_UPSTREAM_URLS = {
+    "antigravity": "http://127.0.0.1:8080/v1",
+    "local": "http://127.0.0.1:11434/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "openai": "https://api.openai.com/v1",
     "groq": "https://api.groq.com/openai/v1",
-    "antigravity": "http://127.0.0.1:8080/v1",
-    "ollama": "http://127.0.0.1:11434/v1",
 }
-# Providers that authenticate with a bearer token. Local bridges do not.
-WIZARD_KEY_PROVIDERS = frozenset({"openrouter", "openai", "groq", "custom"})
+
+# A placeholder satisfies agents that insist on a non-empty key, while the real
+# subscription session travels upstream in the client's Authorization header.
+WIZARD_PLACEHOLDER_KEY = "dummy"
+
+WIZARD_TIER_NOTES = {
+    "antigravity": (
+        "Using your active Google One Pro subscription via the local Antigravity "
+        "bridge. No API key needed."
+    ),
+    "claude_session": (
+        "Using your Claude Code login session. No API key needed; the gateway "
+        "forwards your session token upstream."
+    ),
+    "local": "Fully local and offline. No API key needed.",
+}
+
+
+def choose_upstream(input_fn) -> str:
+    """The grouped provider menu: flat-rate tier first, paid tier last.
+
+    Kept separate from the generic `choose` so the two tiers read as headings in
+    the terminal rather than one undifferentiated list -- the free path should be
+    the obvious default, and it is option 1.
+    """
+    from . import ux
+
+    while True:
+        sys.stderr.write("\nWhere should requests go upstream?\n")
+        sys.stderr.write(
+            ux.dim(
+                "  -- $0 per token: flat-rate subscriptions & local engines "
+                "(no API key) --\n",
+                stream=sys.stderr,
+            )
+        )
+        for number, _key, label in WIZARD_SUBSCRIPTION_UPSTREAMS:
+            sys.stderr.write(f"  [{number}] {label}\n")
+        sys.stderr.write(
+            ux.dim("-- paid: metered per-token APIs (asks for an API key) --\n", stream=sys.stderr)
+        )
+        for number, _key, label in WIZARD_COMMERCIAL_UPSTREAMS:
+            sys.stderr.write(f"  [{number}] {label}\n")
+        raw = input_fn(f"Select 1-{len(WIZARD_UPSTREAMS)} [1]: ").strip() or "1"
+        for number, key, _label in WIZARD_UPSTREAMS:
+            if raw == number:
+                return key
+        sys.stderr.write(f"  please enter 1-{len(WIZARD_UPSTREAMS)}\n")
 
 
 def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -1122,12 +1198,15 @@ def build_wizard_preset(
     api_key: Optional[str] = None,
     classifier_url: Optional[str] = None,
     classifier_key: Optional[str] = None,
+    anthropic_surface: Optional[bool] = None,
 ) -> dict:
     """The `.env` values the launcher should apply. Pure and testable.
 
     `upstream_url`/`api_key` let the caller point at any OpenAI-compatible
     provider (the "choose endpoint + API" step); when they are omitted the
-    existing `.env` value wins, then the strategy's default.
+    existing `.env` value wins, then the strategy's default. `anthropic_surface`
+    forces the Claude Code surface on independently of the chosen agent, which is
+    how the subscription-session upstream is wired.
     """
     existing = existing or {}
     preset: dict = {
@@ -1156,7 +1235,7 @@ def build_wizard_preset(
         resolved = classifier_key or existing.get("CLASSIFIER_API_KEY")
         if resolved:
             preset["CLASSIFIER_API_KEY"] = resolved
-    if agent == "claude":
+    if agent == "claude" or anthropic_surface:
         preset["ANTHROPIC_SURFACE"] = "1"
     return preset
 
@@ -1217,23 +1296,41 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     env_path = Path.cwd() / ".env"
     existing = read_env_file(env_path)
 
-    # --- endpoint + API key for any provider --------------------------------
-    provider = choose(
-        "\nWhich upstream endpoint (HTTP) should requests go to?\n",
-        WIZARD_UPSTREAMS,
-        input_fn,
-    )
+    # --- upstream: free tier first, the paid tier behind one extra step -----
+    provider = choose_upstream(input_fn)
+    if provider == "commercial":
+        provider = choose("\nWhich commercial provider?\n", WIZARD_COMMERCIAL, input_fn)
+
+    existing_key = existing.get("UPSTREAM_API_KEY", "")
+    anthropic_surface = provider == "claude_session"
+
     if provider == "custom":
         default_url = existing.get("UPSTREAM_BASE_URL") or "https://api.openai.com/v1"
         upstream_url = (
             input_fn(f"Upstream base URL [{default_url}]: ").strip() or default_url
+        )
+    elif provider == "claude_session":
+        # The session lives behind whatever endpoint Claude Code already uses;
+        # keep the current one when there is one, otherwise assume a local bridge.
+        default_url = (
+            existing.get("UPSTREAM_BASE_URL") or WIZARD_UPSTREAM_URLS["antigravity"]
+        )
+        upstream_url = (
+            input_fn(
+                f"Upstream base URL for the Claude session [{default_url}]: "
+            ).strip()
+            or default_url
+        )
+    elif provider == "local":
+        default_url = existing.get("UPSTREAM_BASE_URL") or WIZARD_UPSTREAM_URLS["local"]
+        upstream_url = (
+            input_fn(f"Local engine base URL [{default_url}]: ").strip() or default_url
         )
     else:
         upstream_url = WIZARD_UPSTREAM_URLS[provider]
 
     api_key = ""
     if provider in WIZARD_KEY_PROVIDERS:
-        existing_key = existing.get("UPSTREAM_API_KEY", "")
         hint = " (blank keeps the existing key)" if existing_key else ""
         api_key = input_fn(f"API key for {provider}{hint}: ").strip()
         if not api_key and not existing_key:
@@ -1243,6 +1340,14 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                     stream=sys.stderr,
                 )
             )
+    elif provider in WIZARD_SUBSCRIPTION_PROVIDERS:
+        # A subscription bridge or local engine never needs a key of ours: the
+        # client's own session is forwarded upstream. Keep a real key if the user
+        # already had one, otherwise satisfy clients that demand a non-empty one.
+        api_key = existing_key or WIZARD_PLACEHOLDER_KEY
+        note = WIZARD_TIER_NOTES.get(provider)
+        if note:
+            sys.stderr.write("\n" + ux.cyan(note, stream=sys.stderr) + "\n")
 
     # `external_jev` is the one strategy that needs its own classifier endpoint.
     classifier_url = ""
@@ -1272,6 +1377,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         api_key=api_key,
         classifier_url=classifier_url,
         classifier_key=classifier_key,
+        anthropic_surface=anthropic_surface,
     )
     update_env_file(env_path, preset)
     os.environ.update({key: str(value) for key, value in preset.items()})

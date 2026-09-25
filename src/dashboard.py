@@ -45,14 +45,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <h1 class="text-xl font-bold">agent-context-gateway</h1>
       <p id="sub" class="text-sm text-slate-400">loading…</p>
     </div>
-    <div id="conn" class="badge keep">connecting…</div>
+    <div class="flex items-center gap-2">
+      <div id="tier" class="badge pass">tier…</div>
+      <div id="conn" class="badge keep">connecting…</div>
+    </div>
   </header>
 
   <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="card p-4"><div class="text-xs text-slate-400">rate-limit quota saved</div>
+      <div id="quota" class="num text-2xl font-bold mt-1 text-amber-300">–</div>
+      <div id="usd" class="num text-xs text-emerald-400 mt-1">–</div></div>
     <div class="card p-4"><div class="text-xs text-slate-400">tokens saved</div>
       <div id="tokens" class="num text-2xl font-bold mt-1">–</div></div>
-    <div class="card p-4"><div class="text-xs text-slate-400">dollars saved*</div>
-      <div id="usd" class="num text-2xl font-bold mt-1 text-emerald-400">–</div></div>
     <div class="card p-4"><div class="text-xs text-slate-400">requests</div>
       <div id="requests" class="num text-2xl font-bold mt-1">–</div></div>
     <div class="card p-4"><div class="text-xs text-slate-400">p50 / p90 latency</div>
@@ -99,6 +103,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </section>
 
   <footer class="text-xs text-slate-500 space-y-1">
+    <p>quota saved = share of the offered tool schemas the upstream never had to read (the hourly limit you did not touch).</p>
     <p>* dollars are an estimate at the benchmark price; exact token counts need the upstream's tokenizer.</p>
     <p>auto-refreshes every 3s · <span id="err" class="text-rose-400"></span></p>
   </footer>
@@ -127,11 +132,18 @@ async function jget(url) {
 
 async function refreshStats() {
   const d = await jget("/ui/api/stats");
+  $("quota").textContent = (d.quota_preserved_pct || 0).toFixed(1) + "%";
+  $("usd").textContent = (d.tools_forwarded || 0) + " of " + (d.tools_offered || 0) +
+    " tools forwarded · ~$" + d.estimated_usd_saved.toFixed(4) + " on a metered plan";
   $("tokens").textContent = d.estimated_tokens_saved.toLocaleString();
-  $("usd").textContent = "$" + d.estimated_usd_saved.toFixed(4);
   $("requests").textContent = d.requests.toLocaleString();
   $("latency").textContent = d.latency_ms.p50.toFixed(0) + " / " + d.latency_ms.p90.toFixed(0) + "ms";
   $("sub").textContent = "benchmark $" + d.benchmark_usd_per_mtoken.toFixed(2) + "/M prompt tokens";
+
+  const tier = d.connection || {};
+  $("tier").textContent = tier.label || "unknown tier";
+  $("tier").className = "badge " +
+    (tier.tier === "subscription" ? "strip" : tier.tier === "local" ? "sel" : "pass");
 
   const feed = $("feed");
   feed.textContent = "";
@@ -267,10 +279,11 @@ def dashboard_response() -> HTMLResponse:
     return HTMLResponse(DASHBOARD_HTML)
 
 
-def stats_payload(analytics, recent_limit: int = 20) -> Dict[str, Any]:
+def stats_payload(analytics, recent_limit: int = 20, connection=None) -> Dict[str, Any]:
     """Analytics numbers plus the recent-request feed, UI-shaped."""
     data = analytics.compute().as_dict()
     data["recent"] = recent_requests(analytics, recent_limit)
+    data["connection"] = connection or {}
     return data
 
 

@@ -25,7 +25,13 @@ from src.bridge import (
 )
 from src.config import ESCAPE_TOKEN
 from src.classifier import Classifier
-from src.gateway import create_app, head_could_be_escape, sniff_for_escape
+from src.gateway import (
+    client_upstream_auth,
+    create_app,
+    head_could_be_escape,
+    sniff_for_escape,
+    upstream_auth_header,
+)
 from tests.mock_upstream import (
     DEFAULT_TEXT,
     done,
@@ -292,6 +298,43 @@ async def test_client_authorization_is_not_forwarded_upstream(api, mock_state, s
     headers = {k.lower(): v for k, v in mock_state.requests[0]["headers"].items()}
     assert headers.get("authorization") == f"Bearer {settings.upstream_api_key}"
     assert "client-secret" not in headers.get("authorization", "")
+
+
+async def test_dummy_upstream_key_forwards_the_subscription_session(
+    settings, store, memory, mock_state
+):
+    """A bridge/local upstream has no key of ours, so the client's rides along."""
+    bridged = replace(settings, upstream_api_key="dummy")
+    app = create_app(settings=bridged, store=store, memory=memory, classifier=Classifier(bridged))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gw") as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=openai_body("run the tests"),
+            headers={"Authorization": "Bearer subscription-session"},
+        )
+        assert response.status_code == 200
+
+    headers = {k.lower(): v for k, v in mock_state.requests[0]["headers"].items()}
+    assert headers.get("authorization") == "Bearer subscription-session"
+
+
+def test_upstream_auth_header_never_replaces_a_real_key_with_a_client_token():
+    assert upstream_auth_header("sk-real", "Bearer session") == "Bearer sk-real"
+    assert upstream_auth_header("dummy", "Bearer session") == "Bearer session"
+    # No client session and no real key: keep the placeholder, which some
+    # upstreams require to be non-empty, rather than sending nothing.
+    assert upstream_auth_header("dummy") == "Bearer dummy"
+    assert upstream_auth_header("") == ""
+
+
+def test_client_gateway_key_is_never_leaked_upstream():
+    request = httpx.Request(
+        "POST", "http://gw/v1/chat/completions", headers={"Authorization": "Bearer s3cret"}
+    )
+    # `s3cret` authenticates the client to us; it must not become the upstream key.
+    assert client_upstream_auth(request, "s3cret") == ""
+    assert client_upstream_auth(request, "some-other-key") == "Bearer s3cret"
 
 
 # ------------------------------------------------------------------------------
