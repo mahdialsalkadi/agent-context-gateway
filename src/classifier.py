@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 import httpx
 
 from .config import (
+    DEFAULT_SELECTIVE_TOOL_LIMIT,
     CLASSIFIER_MODE_EXTERNAL_JEV,
     CLASSIFIER_MODE_HEURISTICS,
     CLASSIFIER_MODE_LOCAL_OLLAMA,
@@ -127,6 +129,128 @@ def strip_escape_instruction(text: str) -> str:
         text.replace(ESCAPE_INSTRUCTION, "")
         .replace(ESCAPE_INSTRUCTION.strip(), "")
     )
+
+
+# ------------------------------------------------------------------------------
+# Selective sub-tool pruning
+# ------------------------------------------------------------------------------
+# Tools an agent cannot work without, even when the prompt does not name them:
+# the escape-replay contract promises a shell, `fetch_log` is the gateway's own
+# retrieval surface, and reading files is how an agent re-establishes context
+# after a strip. Kept verbatim, always.
+ALWAYS_KEEP_TOOLS = frozenset({"bash", "shell", "terminal", "fetch_log", "read_file"})
+
+_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+
+# Words too common to carry signal about which tool a turn needs. Without this,
+# "search the web for tutorials" ranks `screenshot` because its description
+# contains "the".
+STOPWORDS = frozenset(
+    "a an and are as at be by for from has have in into is it its of on or that "
+    "the their them then there these they this to was were will with without you your"
+    .split()
+)
+
+# Sublinear IDF weights rare terms up; a term in every document is worthless for
+# ranking. The +1 inside the log keeps the weight positive and defined for a term
+# that somehow appears in every tool.
+def _bm25_scores(query_tokens: Sequence[str], documents: Sequence[Sequence[str]]) -> List[float]:
+    """BM25 ranking of `documents` against `query_tokens`, k1=1.2, b=0.75.
+
+    Implemented inline rather than pulled in as a dependency: the whole ranker
+    must stay well under 2ms for a 30-tool payload, and BM25 over a few dozen
+    short documents is a handful of array passes.
+    """
+    total_docs = len(documents)
+    if total_docs == 0 or not query_tokens:
+        return [0.0] * total_docs
+
+    doc_tokens = [list(document) for document in documents]
+    doc_counts = [len(tokens) or 1 for tokens in doc_tokens]
+    average_length = sum(doc_counts) / total_docs
+
+    document_frequency: Dict[str, int] = {}
+    for tokens in doc_tokens:
+        for term in set(tokens):
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+
+    scores: List[float] = []
+    for tokens, count in zip(doc_tokens, doc_counts):
+        score = 0.0
+        for term in query_tokens:
+            frequency = tokens.count(term)
+            if not frequency:
+                continue
+            df = document_frequency.get(term, 0)
+            idf = math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
+            tf_component = (frequency * 2.2) / (
+                frequency + 1.2 * (1.0 - 0.75 + 0.75 * count / average_length)
+            )
+            score += idf * tf_component
+        scores.append(score)
+    return scores
+
+
+def _tool_text(tool: Dict[str, Any]) -> Tuple[str, str]:
+    """(name, searchable text) for either the OpenAI or Anthropic tool shape."""
+    if not isinstance(tool, dict):
+        return "", ""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        name = str(function.get("name") or "")
+        description = str(function.get("description") or "")
+        return name, f"{name} {description}"
+    # Anthropic shape: the fields sit directly on the tool object.
+    name = str(tool.get("name") or "")
+    description = str(tool.get("description") or "")
+    return name, f"{name} {description}"
+
+
+def rank_tools(
+    prompt: str,
+    tools: List[Dict[str, Any]],
+    keep_limit: int = DEFAULT_SELECTIVE_TOOL_LIMIT,
+) -> List[Dict[str, Any]]:
+    """The tools worth sending, ranked by relevance to the prompt.
+
+    Mission-critical I/O tools are always preserved; everything else competes on
+    a BM25 score of the prompt against each tool's name and description. Pure
+    and local: no model call, well under 2ms for realistic payload sizes.
+    """
+    try:
+        keep_limit = max(1, int(keep_limit))
+        query_tokens = [
+            token
+            for token in _TOKEN_RE.findall((prompt or "").lower())
+            if token not in STOPWORDS
+        ]
+        if not query_tokens:
+            return list(tools)
+
+        documents = [_TOKEN_RE.findall(_tool_text(tool)[1].lower()) for tool in tools]
+        scores = _bm25_scores(query_tokens, documents)
+
+        # Only shrink the schema when there is actual evidence. A prompt that
+        # matches no tool at all says nothing about which tools matter, so the
+        # safe move is to keep everything rather than gamble on an arbitrary cut.
+        positive = [index for index, score in enumerate(scores) if score > 0.0]
+        if not positive:
+            return list(tools)
+
+        ranked = sorted(positive, key=lambda i: scores[i], reverse=True)
+        kept_indices = set(ranked[:keep_limit])
+
+        # Always-keep tools come along even when they did not match the prompt.
+        for index, tool in enumerate(tools):
+            if _tool_text(tool)[0].lower() in ALWAYS_KEEP_TOOLS:
+                kept_indices.add(index)
+
+        # Preserve payload order: schemas are compared across turns by some
+        # providers for prompt-cache reuse, and reordering them defeats it.
+        return [tool for index, tool in enumerate(tools) if index in kept_indices]
+    except Exception:
+        # Ranking is an optimisation. Any surprise means keep everything.
+        return list(tools)
 
 
 def inject_escape_instruction(messages: List[Dict[str, Any]]) -> bool:
@@ -479,12 +603,14 @@ def get_classifier(settings: Optional[Settings] = None) -> Classifier:
 
 
 __all__ = [
+    "ALWAYS_KEEP_TOOLS",
     "Decision",
     "Classifier",
     "CLASSIFIER_MODE_EXTERNAL_JEV",
     "CLASSIFIER_MODE_HEURISTICS",
     "CLASSIFIER_MODE_LOCAL_OLLAMA",
     "CLASSIFIER_MODE_UPSTREAM_REUSED",
+    "rank_tools",
     "ESCAPE_INSTRUCTION",
     "ESCAPE_TOKEN",
     "decide_route",

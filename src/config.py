@@ -59,6 +59,11 @@ DEFAULT_SNIFF_LIMIT = 512
 DEFAULT_SNIFF_OVERFLOW = 192
 DEFAULT_ESCAPE_SCAN_CHARS = 64
 
+# Selective sub-tool pruning: below this many tools the whole-schema question is
+# not worth a ranking pass, and above it the schemas start costing real tokens.
+SELECTIVE_PRUNING_MIN_TOOLS = 8
+DEFAULT_SELECTIVE_TOOL_LIMIT = 5
+
 ESCAPE_TOKEN = "[ESCAPE_NEED_TOOLS]"
 ESCAPE_INSTRUCTION = (
     f"\n[SYSTEM INSTRUCTION: If you cannot fulfill this request without external "
@@ -275,6 +280,11 @@ class Settings:
     sniff_overflow_bytes: int = DEFAULT_SNIFF_OVERFLOW
     escape_scan_chars: int = DEFAULT_ESCAPE_SCAN_CHARS
 
+    # Selective sub-tool pruning: keep the K tools the prompt actually implies
+    # (plus mission-critical I/O primitives) instead of all-or-nothing.
+    enable_selective_pruning: bool = True
+    selective_tool_limit: int = DEFAULT_SELECTIVE_TOOL_LIMIT
+
     extra_reasoning_patterns: tuple = ()
     env_file: Optional[Path] = None
 
@@ -381,6 +391,10 @@ class Settings:
             "memory_injection": self.memory_injection,
             "anthropic_thinking_passthrough": self.anthropic_thinking_passthrough,
             "allow_legacy_upstream": self.allow_legacy_upstream,
+            "selective_pruning": {
+                "enabled": self.enable_selective_pruning,
+                "tool_limit": self.selective_tool_limit,
+            },
             "profile": os.environ.get("AGENT_GATEWAY_PROFILE") or None,
             "env_file": str(self.env_file) if self.env_file else None,
         }
@@ -523,6 +537,12 @@ def load_settings(
         ),
         escape_scan_chars=_as_int(
             _first(env, ("ESCAPE_SCAN_CHARS",), ""), DEFAULT_ESCAPE_SCAN_CHARS
+        ),
+        enable_selective_pruning=_as_bool(
+            _first(env, ("ENABLE_SELECTIVE_PRUNING",), ""), True
+        ),
+        selective_tool_limit=_as_int(
+            _first(env, ("SELECTIVE_TOOL_LIMIT",), ""), DEFAULT_SELECTIVE_TOOL_LIMIT
         ),
         extra_reasoning_patterns=tuple(
             part.strip() for part in extra_regex.split(",") if part.strip()

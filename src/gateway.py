@@ -50,9 +50,11 @@ from .classifier import (
     decide_route,
     get_classifier,
     inject_escape_instruction,
+    rank_tools,
     strip_escape_instruction,
 )
 from .config import (
+    SELECTIVE_PRUNING_MIN_TOOLS,
     Settings,
     available_profiles,
     find_profile,
@@ -124,6 +126,30 @@ async def _close_quietly(
             await closer.aclose()
         except Exception:
             pass
+
+
+def apply_selective_pruning(
+    settings: Settings, prompt: str, tools: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Maybe shrink a tool schema to the tools this prompt implies.
+
+    Returns (tools, dropped_count). Conservative by design: only fires above
+    SELECTIVE_PRUNING_MIN_TOOLS, and `rank_tools` itself keeps everything when
+    the prompt gives no evidence for any tool.
+    """
+    if (
+        not settings.enable_selective_pruning
+        or not isinstance(tools, list)
+        or len(tools) <= SELECTIVE_PRUNING_MIN_TOOLS
+    ):
+        return tools, 0
+    try:
+        kept = rank_tools(prompt, tools, settings.selective_tool_limit)
+    except Exception:
+        return tools, 0
+    if len(kept) >= len(tools):
+        return tools, 0
+    return kept, len(tools) - len(kept)
 
 
 def head_could_be_escape(text: str) -> bool:
@@ -221,6 +247,10 @@ def create_app(
     def graph() -> GraphMemory:
         if app.state.memory is None:
             app.state.memory = get_memory(cfg())
+            # Route memory's retrieval audits into the same audit log as the
+            # request telemetry, so `agent-gateway stats` sees one stream.
+            if app.state.memory.audit_hook is None:
+                app.state.memory.audit_hook = audit
         return app.state.memory
 
     def upstream_client() -> httpx.AsyncClient:
@@ -265,9 +295,10 @@ def create_app(
             pass
 
     def telemetry(
-        route: str, tool_action: str, elapsed_ms: float, spill: int, req_id: str, extra: int = 0
+        route: str, tool_action: str, elapsed_ms: float, spill: int, req_id: str, extra: int = 0,
+        tools: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
-        return {
+        headers = {
             "X-Proxy-Route": route,
             "X-Proxy-Tool-Action": tool_action,
             "X-Proxy-Latency-MS": f"{elapsed_ms:.2f}",
@@ -275,6 +306,11 @@ def create_app(
             "X-Proxy-Request-Id": req_id,
             "X-Proxy-Intercepted": str(extra),
         }
+        if tools is not None:
+            before, after = tools
+            headers["X-Proxy-Tools-Before"] = str(before)
+            headers["X-Proxy-Tools-After"] = str(after)
+        return headers
 
     def upstream_request(client: httpx.AsyncClient, body: Dict[str, Any]) -> httpx.Request:
         headers = {"Content-Type": "application/json"}
@@ -381,6 +417,8 @@ def create_app(
         route, tool_action = "Bypass", "Bypassed"
         spill_count = 0
         intercepted = 0
+        tools_before = 0
+        spilled_chars = 0
 
         if bypass:
             client = upstream_client()
@@ -415,6 +453,15 @@ def create_app(
                 tools.append(FETCH_LOG_TOOL)
                 body["tools"] = tools
 
+        # What the upstream is about to be charged for if the gateway does
+        # nothing: the caller's schema plus the synthetic retrieval tool.
+        tools_before = len(tools) if has_tools else 0
+
+        def tools_sent() -> int:
+            """Schema size in the body as it will actually be dispatched."""
+            current = body.get("tools")
+            return len(current) if isinstance(current, list) else 0
+
         # 3. Route.
         last_role = messages[-1].get("role") if messages else ""
         is_tool_turn = last_role in ("tool", "function", "tool_call")
@@ -426,6 +473,28 @@ def create_app(
                 spill_count = artifacts().truncate_tool_outputs(messages, session_id)
             except Exception:
                 spill_count = 0
+            # Characters of tool output the upstream will not see -- what the
+            # analytics engine books as the spillover saving.
+            try:
+                spilled_chars = artifacts().last_truncated_chars
+            except Exception:
+                spilled_chars = 0
+
+        created_escape_message = False
+        # Selective sub-tool pruning: with a large schema, keep only the tools
+        # this prompt implies instead of choosing between everything and nothing.
+        # Must precede the all-or-nothing strip so a stripped turn cannot rank.
+        selective_count = 0
+        if (
+            has_tools
+            and not is_tool_turn
+            and not decision.stripped
+            and body.get("tool_choice") in (None, "auto")
+        ):
+            tools, selective_count = apply_selective_pruning(cfg(), prompt, tools)
+            if selective_count:
+                body["tools"] = tools
+                has_tools = bool(tools)
 
         created_escape_message = False
         if decision.stripped:
@@ -544,6 +613,9 @@ def create_app(
             "req_id": req_id, "surface": "openai", "session_id": session_id, "model": model,
             "route": route, "tool_action": tool_action, "reason": decision.reason,
             "spill_count": spill_count, "intercepted": intercepted,
+            "spilled_chars": spilled_chars,
+            "tools_before": tools_before, "tools_after": tools_sent(),
+            "selective_dropped": selective_count,
             "latency_ms": round(elapsed, 2),
         })
         return StreamingResponse(
@@ -551,7 +623,10 @@ def create_app(
                 upstream, client, iterator, bg, session_id, prompt, prefetched
             ),
             status_code=upstream.status_code,
-            headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted),
+            headers=telemetry(
+                route, tool_action, elapsed, spill_count, req_id, intercepted,
+                (tools_before, tools_sent()),
+            ),
         )
 
     @app.post("/v1/messages/count_tokens")

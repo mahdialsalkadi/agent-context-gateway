@@ -93,7 +93,9 @@ No `--profile` flag means `.env`, exactly as before.
 | Module | Responsibility |
 | --- | --- |
 | `src/config.py` | Every path and credential, resolved from the environment |
-| `src/classifier.py` | Four routing modes, heuristics, decision cache |
+| `src/classifier.py` | Four routing modes, heuristics, sub-tool ranker, decision cache |
+| `src/analytics.py` | Token & dollar savings and latency percentiles from the audit log |
+| `src/cli.py` | The `agent-gateway` command: start/stop/status/stats/test/service |
 | `src/artifacts.py` | Spillover store, content-hash handles, `fetch_log` resolution |
 | `src/memory.py` | Knowledge graph: extraction, decay, graduation, compaction |
 | `src/bridge.py` | Anthropic ⇄ OpenAI request/response/SSE translation |
@@ -128,6 +130,10 @@ These are enforced by the test suite, not just documented:
    health payload to carry the gateway's own markers and to report the same
    `DATA_DIR`; anything else is surfaced as `foreign_service_on_port` rather
    than silently accepted as healthy.
+6. **Pruning never gambles.** Selective sub-tool ranking only shrinks a schema
+   when the prompt gives positive evidence for some tool; an unmatched prompt
+   keeps everything. Mission-critical I/O (`bash`, `read_file`, `fetch_log`)
+   is always preserved, and an explicit `tool_choice` is never ranked.
 
 ---
 
@@ -367,6 +373,8 @@ token does not silently disable the mode.
 | `MEMORY_INJECTION` | `1` | Inject recalled triples into prompts |
 | `MEMORY_INJECT_TOOL_TURNS` | `0` | Also inject mid tool-loop |
 | `TRUNCATE_THRESHOLD_CHARS` | `800` | Spill tool output above this size |
+| `ENABLE_SELECTIVE_PRUNING` | `1` | Rank sub-tools when the schema is large |
+| `SELECTIVE_TOOL_LIMIT` | `5` | Prompt-matched tools kept (mission-critical always survive) |
 | `SNIFF_LIMIT_BYTES` | `512` | Escape look-ahead ceiling |
 | `ESCAPE_SCAN_CHARS` | `64` | Give up sniffing this early |
 | `REASONING_MODEL_REGEX` | unset | Extra comma-separated regex for models never to prune |
@@ -432,6 +440,85 @@ its answers are cached for five minutes. With `CLASSIFIER_MODE=heuristics` there
 is no network step at all: the ambiguous branch resolves straight to `keep`,
 which is why that mode is both free and impossible to break.
 
+### Selective sub-tool pruning
+
+All-or-nothing is a blunt instrument once an agent offers 20+ tools. When the
+schema exceeds `SELECTIVE_PRUNING_MIN_TOOLS` (default 8), a local BM25 ranker
+scores each tool's name and description against the prompt and keeps only the
+`SELECTIVE_TOOL_LIMIT` (default 5) best — plus the mission-critical I/O tools
+(`bash`, `read_file`, `fetch_log`), which are never dropped.
+
+Measured on a 25-tool catalog with 3 properties each:
+
+```text
+full catalog sent to the upstream : ~2625 tokens per turn
+after selective pruning           : 25 -> 4-5 tools (~105 tokens per kept tool)
+ranker overhead                   : 0.083 ms per call   (budget: 2 ms)
+```
+
+```bash
+ENABLE_SELECTIVE_PRUNING=1     # default
+SELECTIVE_TOOL_LIMIT=5         # how many prompt-matched tools survive
+```
+
+The ranker is honest by construction: a prompt that matches no tool at all keeps
+the whole schema (no evidence, no gamble), stop words carry no weight, payload
+order is preserved so prompt caches stay warm, and an explicit `tool_choice`
+disables ranking entirely. Telemetry: `X-Proxy-Tools-Before` / `X-Proxy-Tools-After`
+headers, and `tools_before` / `tools_after` / `selective_dropped` in the audit log.
+
+### Seeing the savings: `agent-gateway stats`
+
+```text
+agent-context-gateway -- savings dashboard
+==============================================================
+  audit source     ~/.agent-gateway/logs/audit.log
+
+  requests         3        sessions        1
+  spills           0        fetch_log hits  0
+
+  routes
+    Classifier-FailOpen                     2  ########################
+    FastPath-Keep                           1  ############............
+
+  estimated savings (see note)
+    tool schemas pruned        4,960 tokens   (62 selective drops)
+    spilled tool output            0 tokens   (0 chars)
+    escape replays                 0
+    ----------------------------------------------
+    TOTAL                      4,960 tokens
+    ~ $0.0149 at $3.00/M prompt tokens
+
+  latency (gateway overhead, ms)
+    p50    14.53   p90    50.67   p99    50.67
+
+  note: token and dollar figures are estimates; exact counts require the
+  upstream's tokenizer, which no OpenAI-compatible API exposes.
+```
+
+```bash
+agent-gateway stats            # one snapshot
+agent-gateway stats --live     # refreshes in place, Ctrl-C to stop
+agent-gateway stats --json     # for your own dashboards
+```
+
+### Global CLI
+
+```bash
+pip install -e .               # puts `agent-gateway` on your PATH
+
+agent-gateway start [--profile NAME] [--port N] [--daemon]
+agent-gateway stop              # stops what this CLI started; never guesses PIDs
+agent-gateway status            # pid, health, mode, profile, foreign-service flag
+agent-gateway stats [--live|--json]
+agent-gateway test              # the offline suite, no keys needed
+agent-gateway service install   # systemd user unit, written AND enabled
+```
+
+`agent-gateway stop` only ever signals a PID it recorded itself; if something
+else answers on the port it says so and exits non-zero rather than killing an
+innocent process.
+
 ### Early-stream escape
 
 Pruning is a bet. When the bet is wrong, the model is told how to say so:
@@ -492,7 +579,7 @@ pytest tests/ -v
 ```
 
 ```text
-224 passed
+290 passed
 ```
 
 The suite is **fully offline**: `tests/mock_upstream.py` provides both a real
@@ -500,7 +587,9 @@ local HTTP server and an in-process `httpx.MockTransport`, so no API keys, no
 network and no spend. It also answers the gateway's *classifier* probes, which is
 how `upstream_reused` is proven over real HTTP. `tests/conftest.py` wires the
 fixtures together; `tests/test_sentinel.py` covers the watchdog;
-`tests/test_classifier_modes.py` covers the four modes and profiles. Coverage
+`tests/test_classifier_modes.py` covers the four modes and profiles;
+`tests/test_selective_pruning.py`, `tests/test_analytics.py`, `tests/test_cli.py`
+and `tests/test_memory_retrieval.py` cover the newer phases. Coverage
 highlights:
 
 | Area | What is asserted |
@@ -516,6 +605,10 @@ highlights:
 | Classifier modes | `heuristics` provably makes **zero** network calls (HTTP client poisoned); `upstream_reused` routes over real HTTP carrying the upstream's own bearer token; `local_ollama` payload shape; `external_jev` blueprint probability |
 | Profiles | Every shipped profile loads, resolves a valid mode and cannot forward to itself; unknown profile exits `2`; **switching profiles leaves the WAL graph and the spilled artifacts byte-for-byte intact** |
 | Thinking blocks | Dropped by default; opt-in passthrough emits `thinking` before text, for `reasoning_content` / `reasoning` / `thinking` and part-lists |
+| Selective pruning | 25-tool catalog shrinks to the tools the prompt implies; mission-critical I/O always kept; unmatched prompts keep everything; **ranking measured < 2 ms** |
+| Analytics | Synthetic audit rows in, savings and percentiles out; torn lines skipped; legacy rows estimated |
+| CLI | pidfile lifecycle against a really-spawned daemon; `stop` refuses to signal a PID it did not record; service unit generation |
+| Memory retrieval | Typos and prefixes forgiven, unrelated words not; budget packing never splits a fact; audit hook writes one row per retrieval |
 | Invariants | Loop guard, fail-open classification, unknown-field passthrough, no secret leakage in `/health` |
 
 ---

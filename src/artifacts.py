@@ -82,6 +82,10 @@ class ArtifactStore:
         self.truncate_threshold_chars = max(1, int(truncate_threshold_chars))
         # content hash -> (handle, path). Rebuilt from disk when cold.
         self._index: Dict[str, Tuple[str, str]] = {}
+        # Characters replaced by handles during the most recent
+        # `truncate_tool_outputs` call -- what the analytics engine books as
+        # spillover savings. Recomputed per call, not accumulated.
+        self.last_truncated_chars = 0
 
     # --- filesystem --------------------------------------------------------
     def ensure_dir(self) -> None:
@@ -213,6 +217,7 @@ class ArtifactStore:
         """
         spilled = 0
         total = len(messages)
+        self.last_truncated_chars = 0
 
         for index, message in enumerate(messages):
             if message.get("role") != "tool":
@@ -226,6 +231,7 @@ class ArtifactStore:
 
             handle, _ = self.spill(raw, session_id)
             spilled += 1
+            self.last_truncated_chars += len(raw) - len(summarize(raw, handle))
             message["content"] = summarize(raw, handle)
 
         return spilled

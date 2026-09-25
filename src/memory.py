@@ -21,6 +21,7 @@ into a request path.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -39,6 +40,16 @@ DECAY_FLOOR = 0.15
 MAX_MATCHED_ENTITIES = 32
 MAX_INGEST_TRIPLES = 24
 
+# A fuzzy match may differ from the query token by this many edits. 1 covers
+# typos and plural forms on names of real-world length; 2 would start pulling in
+# unrelated entities on short names.
+FUZZY_EDIT_DISTANCE = 1
+# Below this length a single edit is a large fraction of the word, so fuzzy
+# matching fires on far too much. Exact boundary matching still applies. 5 is
+# the shortest name worth fuzzing (`redis`), while 3-letter entities like `api`
+# stay exact-only.
+FUZZY_MIN_LENGTH = 5
+
 # Sentiment and throwaway markers: worth noting, never worth trusting long.
 EPHEMERAL_SENTIMENT_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\b(hate|dislike|love|annoyed|slow|fast|bad|good|awesome|ugly|nice)\b", re.I),
@@ -56,6 +67,29 @@ TRIPLE_PATTERNS: Tuple[re.Pattern, ...] = (
         re.I,
     ),
 )
+
+
+def _levenshtein(a: str, b: str, cap: int = FUZZY_EDIT_DISTANCE) -> int:
+    """Edit distance with early exit once the budget is exceeded.
+
+    Returns `cap + 1` when the distance provably exceeds `cap`, which is all the
+    fuzzy matcher needs -- and keeps a 5000-entity scan cheap.
+    """
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, 1):
+        current = [i]
+        row_min = i
+        for j, char_b in enumerate(b, 1):
+            cost = 0 if char_a == char_b else 1
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > cap:
+            return cap + 1
+        previous = current
+    return previous[-1]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -149,6 +183,10 @@ class GraphMemory:
         self.graduation_sessions = max(2, int(graduation_sessions))
         self.ephemeral_ttl_seconds = float(ephemeral_ttl_seconds)
         self.decay_floor = float(decay_floor)
+        # Audit sink for retrieval injections. Defaults to the configured audit
+        # log; tests and embedders can point it anywhere -- or at None to keep
+        # retrieval silent.
+        self.audit_hook = None  # Optional[Callable[[Dict[str, Any]], None]]
 
     # --- connection --------------------------------------------------------
     def connect(self) -> sqlite3.Connection:
@@ -341,7 +379,11 @@ class GraphMemory:
         """Entity names appearing in `query`, matched on token boundaries.
 
         Boundary matching matters: the entity `post` must not fire for a query
-        about `postgres`.
+        about `postgres`. On top of exact boundaries, near-matches within one
+        edit are accepted for longer names, so `postgresl` or `postgress`
+        still retrieve the `postgres` facts. Every accepted fuzzy match costs a
+        Levenshtein call over at most a few thousand short names, which stays
+        in the sub-millisecond range.
         """
         try:
             conn = self.connect()
@@ -359,19 +401,43 @@ class GraphMemory:
             return []
 
         haystack = (query or "").lower()
+        query_tokens = set(re.findall(r"[a-z0-9_-]+", haystack))
         matched: List[str] = []
         for row in rows:
             name = row["name"]
             if not name or len(name) < 3:
                 continue
-            try:
-                if re.search(rf"(?<![a-z0-9_]){re.escape(name.lower())}(?![a-z0-9_])", haystack):
-                    matched.append(name)
-            except re.error:
-                continue
+            lowered = name.lower()
+            hit = bool(
+                re.search(rf"(?<![a-z0-9_]){re.escape(lowered)}(?![a-z0-9_])", haystack)
+            )
+            if not hit:
+                hit = self._fuzzy_token_hit(lowered, query_tokens)
+            if hit:
+                matched.append(name)
             if len(matched) >= limit:
                 break
         return matched
+
+    @staticmethod
+    def _fuzzy_token_hit(name: str, query_tokens: Set[str]) -> bool:
+        """True when a query token is within one edit of the entity name.
+
+        Only names of FUZZY_MIN_LENGTH+ characters participate: on a 3-letter
+        entity a single edit is a third of the word, and the match rate would
+        swamp the exact-match signal. Prefix matches (`k8s` for `k8s_cluster`)
+        count too, since extracted names often carry suffixes.
+        """
+        if len(name) < FUZZY_MIN_LENGTH:
+            return False
+        for token in query_tokens:
+            if len(token) < FUZZY_MIN_LENGTH - 1:
+                continue
+            if token.startswith(name) or name.startswith(token):
+                return True
+            if _levenshtein(name, token) <= FUZZY_EDIT_DISTANCE:
+                return True
+        return False
 
     def retrieve(self, query: str, max_tokens: int = 200, limit: int = 8) -> str:
         """Delimited block of winning triples, or "" when nothing matches."""
@@ -403,17 +469,59 @@ class GraphMemory:
         if not rows:
             return ""
 
-        triples = [
-            f"- ({row['source']}) --[{row['predicate']}]--> ({row['target']})"
-            for row in rows
-        ]
-        block = (
+        header = (
             "<relevant_memory>\n"
             "Recalled facts from earlier sessions (may be stale, verify before relying):\n"
-            + "\n".join(triples)
-            + "\n</relevant_memory>"
         )
-        return block[: max(200, int(max_tokens) * 4)]
+        budget = max(40, int(max_tokens) * 4) - len(header) - len("\n</relevant_memory>")
+
+        # Pack whole triples, newest-highest-confidence first (the query's own
+        # ORDER BY), until the budget is spent. A partial line would inject a
+        # mangled fact, which is worse than injecting none.
+        packed: List[str] = []
+        used = 0
+        for row in rows:
+            line = f"- ({row['source']}) --[{row['predicate']}]--> ({row['target']})"
+            cost = len(line) + (1 if packed else 0)
+            if used + cost > budget:
+                break
+            packed.append(line)
+            used += cost
+
+        if not packed:
+            return ""
+
+        block = header + "\n" + "\n".join(packed) + "\n</relevant_memory>"
+        self._log_injection(len(packed), len(entities), len(block))
+        return block
+
+    def _log_injection(self, triples_injected: int, entities_matched: int, block_chars: int) -> None:
+        """Audit a retrieval so dashboards can show memory's contribution.
+
+        Goes through `audit_hook` when one is installed (the gateway sets it to
+        its own audit writer), else appends to the configured audit log.
+        Best-effort by design: an audit failure must never break a retrieval.
+        """
+        record = {
+            "ts": int(time.time()),
+            "surface": "memory",
+            "entities_matched": entities_matched,
+            "triples_injected": triples_injected,
+            "block_chars": block_chars,
+        }
+        try:
+            hook = self.audit_hook
+            if hook is not None:
+                hook(record)
+                return
+            from .config import load_settings
+
+            path = load_settings().audit_log_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     # --- maintenance -------------------------------------------------------
     def compact(self, now: Optional[float] = None) -> Dict[str, Any]:

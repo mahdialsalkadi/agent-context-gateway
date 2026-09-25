@@ -42,7 +42,7 @@ dev = [
 ]
 
 [project.scripts]
-agent-gateway = "src.gateway:main"
+agent-gateway = "src.cli:main"
 agent-sentinel = "src.sentinel:main"
 agent-mock-upstream = "tests.mock_upstream:main"
 
