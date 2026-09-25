@@ -30,7 +30,7 @@ own machine — no second provider, no second key. See
 
 ```bash
 pip install -e .
-agent-gateway             # guided launcher: agent, strategy, port -- then starts
+agent-gateway             # 3-step wizard: agent, provider, engine -- then starts
 agent-gateway init        # or the fuller 60-second setup, writes .env for you
 agent-gateway run claude  # starts the gateway AND Claude Code, wired together
 
@@ -600,7 +600,7 @@ agent-gateway stats --json     # for your own dashboards
 ```bash
 pip install -e .               # puts `agent-gateway` on your PATH
 
-agent-gateway                   # no args -> guided launcher (agent, routing, provider, port)
+agent-gateway                   # no args -> 3-step wizard: agent, provider, engine
 agent-gateway interactive       # the same launcher, explicitly
 agent-gateway init              # interactive setup wizard -> writes .env
 agent-gateway run claude        # gateway (auto-started) + agent in one command
@@ -615,24 +615,50 @@ agent-gateway install-shim      # universal ~/.local/bin/agent-gateway wrapper
 agent-gateway service install   # systemd user unit, written AND enabled
 ```
 
-The launcher writes or updates `.env`, picks a free port when `8090`/`8080` are
-occupied, starts the gateway in the background, and — if you chose an agent —
-hands off to `agent-gateway run <agent>`. It also installs the global wrapper
-below, so the next command works from any directory and any shell.
-
-**Choosing where requests go.** Step 3 of the launcher is grouped into the two
-tiers that matter: flat-rate subscriptions and local engines (no API key — the
-reason the gateway exists), and metered APIs (which ask for a key):
+The launcher is **three questions long**. It opens with a status box that
+reports what it detected (an Antigravity bridge on `:8080`, Ollama on `:11434`,
+or nothing), asks agent → provider → engine, and then does the rest without
+nagging: the port is picked silently (`8090` free, else `8091`; override with
+`--port` if you ever need to), the gateway starts in the background, and — if
+you chose an agent — it attaches straight into that agent's terminal with the
+right environment injected. It also installs (or repairs) the global wrapper
+below, so the next `agent-gateway` works from any directory and any shell.
 
 ```text
-Where should requests go upstream?
-  -- $0 per token: flat-rate subscriptions & local engines (no API key) --
-  [1] Google Antigravity bridge   (Google One Pro / free)  http://127.0.0.1:8080/v1
-  [2] Claude Code official session (Anthropic surface, forwards your login)
-  [3] Fully local offline engine  (llama-server / Ollama / Vulkan)
-  -- paid: metered per-token APIs (asks for an API key) --
-  [4] Commercial pay-per-token API (OpenRouter, OpenAI, Groq, custom URL)
+╭──────────────────────────────────────────────────────────────╮
+│ agent-gateway                                                │
+│ Antigravity bridge detected on :8080                         │
+╰──────────────────────────────────────────────────────────────╯
+
+── Step 1 · Choose Agent ─────────────────────────────
+  [1] Hermes Agent
+  [2] Claude Code
+  [3] Aider / Cursor
+  [4] Standalone Gateway (run in background only)
+
+── Step 2 · Choose Upstream Provider ─────────────────
+  $0 per token -- flat-rate subscriptions & local engines:
+    [1] Google Antigravity Bridge  (Google One Pro subscription - $0 / no key)
+    [2] Claude Code Official Session  (Anthropic surface - flat subscription)
+    [3] Local Offline LLM  (Ollama / llama-server - $0 / no key)
+  paid -- metered per-token APIs:
+    [4] Commercial Pay-per-token API  (OpenRouter, Groq, OpenAI, custom)
+
+── Step 3 · Routing & Pruning Engine ─────────────────
+    [1] Local Jev-2B Decision  (Vulkan GPU accelerated, ~20ms, offline)
+    [2] Fast Regex Heuristics  (<1ms, zero latency, fail-open, no model)
+    [3] Upstream Reused        (asks the provider you already chose to classify)
+  advanced:
+    [4] Local Ollama classifier (qwen2.5:0.5b / llama3.2)
+    [5] External JEV endpoint  (dedicated classifier URL + key, e.g. OpenRouter)
+
+✔ setup saved to /path/to/.env
+  agent → hermes · upstream → http://127.0.0.1:8080/v1 · engine → local_jev · port → 8091
 ```
+
+**Choosing where requests go.** Step 2 is grouped into the two tiers that
+matter: flat-rate subscriptions and local engines (no API key — the reason the
+gateway exists), and metered APIs (which ask for a key):
 
 Options **1–3 never prompt for an API key.** They forward the client's own
 subscription session upstream (see [Auth passthrough](#auth-passthrough-and-the-free-tiers))
@@ -640,10 +666,9 @@ and write `UPSTREAM_API_KEY=dummy` only so that agents which demand a non-empty
 key still start. Option **1** also sets `ALLOW_LEGACY_UPSTREAM_PORT=1` because
 the Antigravity bridge genuinely lives on `:8080`. Option **4** opens a second
 menu (OpenRouter / OpenAI / Groq / custom URL); *custom* takes any base URL and
-key, so Together, DeepSeek, vLLM, LM Studio or a company proxy all work. Choosing
-`external_jev` as the routing strategy additionally prompts for its own
-classifier endpoint and key. Every value is written to `.env`, and can equally
-be set by hand:
+key, so Together, DeepSeek, vLLM, LM Studio or a company proxy all work. The
+*external JEV* engine additionally prompts for its own classifier endpoint and
+key. Every value is written to `.env`, and can equally be set by hand:
 
 ```bash
 UPSTREAM_BASE_URL=https://api.deepseek.com/v1

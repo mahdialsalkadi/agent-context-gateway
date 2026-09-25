@@ -1033,15 +1033,38 @@ WIZARD_AGENTS = (
     ("1", "hermes", "Hermes Agent"),
     ("2", "claude", "Claude Code"),
     ("3", "aider", "Aider / Cursor"),
-    ("4", "standalone", "Just start Gateway in background (standalone)"),
+    ("4", "standalone", "Standalone Gateway (run in background only)"),
 )
-WIZARD_STRATEGIES = (
-    ("1", "heuristics", "Fast Regex / Heuristics (< 1ms, zero cost, fail-open)"),
-    ("2", "local_jev", "Local Jev-Style Qwen3.5-2B GGUF (~15ms, offline) -- llama-server"),
-    ("3", "upstream_reused", "Upstream Reused (Google Antigravity / Gemini Flash / Copilot bridge)"),
-    ("4", "local_ollama", "Local Ollama (qwen2.5:0.5b / llama3.2)"),
-    ("5", "external_jev", "External JEV / OpenRouter"),
+# Step 3 keeps the three engines every subscription user needs one keystroke
+# away. The remaining specialist modes (local_ollama as a classifier, an
+# external JEV endpoint) live behind "advanced" so the default path stays
+# three questions long.
+WIZARD_ENGINES = (
+    (
+        "1",
+        "local_jev",
+        "Local Jev-2B Decision  (Vulkan GPU accelerated, ~20ms, offline)",
+    ),
+    (
+        "2",
+        "heuristics",
+        "Fast Regex Heuristics  (<1ms, zero latency, fail-open, no model)",
+    ),
+    (
+        "3",
+        "upstream_reused",
+        "Upstream Reused        (asks the provider you already chose to classify)",
+    ),
 )
+WIZARD_ADVANCED_ENGINES = (
+    ("4", "local_ollama", "Local Ollama classifier (qwen2.5:0.5b / llama3.2)"),
+    (
+        "5",
+        "external_jev",
+        "External JEV endpoint  (dedicated classifier URL + key, e.g. OpenRouter)",
+    ),
+)
+WIZARD_STRATEGIES = WIZARD_ENGINES + WIZARD_ADVANCED_ENGINES
 
 _DEFAULT_UPSTREAM_BY_STRATEGY = {
     "local_ollama": "http://127.0.0.1:11434/v1",
@@ -1060,21 +1083,21 @@ WIZARD_SUBSCRIPTION_UPSTREAMS = (
     (
         "1",
         "antigravity",
-        "Google Antigravity bridge   (Google One Pro / free)  http://127.0.0.1:8080/v1",
+        "Google Antigravity Bridge  (Google One Pro subscription - $0 / no key)",
     ),
     (
         "2",
         "claude_session",
-        "Claude Code official session (Anthropic surface, forwards your login)",
+        "Claude Code Official Session  (Anthropic surface - flat subscription)",
     ),
     (
         "3",
         "local",
-        "Fully local offline engine  (llama-server / Ollama / Vulkan)",
+        "Local Offline LLM  (Ollama / llama-server - $0 / no key)",
     ),
 )
 WIZARD_COMMERCIAL_UPSTREAMS = (
-    ("4", "commercial", "Commercial pay-per-token API (OpenRouter, OpenAI, Groq, custom URL)"),
+    ("4", "commercial", "Commercial Pay-per-token API  (OpenRouter, Groq, OpenAI, custom)"),
 )
 WIZARD_UPSTREAMS = WIZARD_SUBSCRIPTION_UPSTREAMS + WIZARD_COMMERCIAL_UPSTREAMS
 
@@ -1114,6 +1137,25 @@ WIZARD_TIER_NOTES = {
     ),
     "local": "Fully local and offline. No API key needed.",
 }
+
+
+def wizard_banner(status: str, width: int = 64) -> str:
+    """The boxed header the launcher opens with.
+
+    Pure so tests can pin it: a plain title line, a status line that reports the
+    free tier, and a rule. ASCII-safe inside the box padding; colour is applied
+    by the caller through `ux` so non-TTY streams stay clean.
+    """
+    top = f"╭{'─' * (width - 2)}╮"
+    bottom = f"╰{'─' * (width - 2)}╯"
+
+    def row(text: str) -> str:
+        padding = max(0, width - 4 - len(text))
+        return f"│ {text}{' ' * padding} │"
+
+    return "\n".join(
+        [top, row("agent-gateway"), row(status), bottom]
+    )
 
 
 def choose_upstream(input_fn) -> str:
@@ -1272,11 +1314,16 @@ def update_env_file(path: Path, updates: dict) -> Path:
 
 
 def cmd_interactive(args: argparse.Namespace) -> int:
-    """The no-argument experience: choose agent, routing, provider, then launch."""
+    """The no-argument experience: agent, provider, engine -- then launch.
+
+    Three numbered steps under a status banner, a silent port, and a gateway
+    that starts (and an agent that attaches) without a fourth question.
+    """
     from . import ux
 
     input_fn = getattr(args, "input_fn", None) or input
     launching = getattr(args, "launch", True)
+    forced_port = getattr(args, "port", None)
 
     # Piped or non-TTY (scripts, pytest, CI): keep the long-standing contract
     # that bare `agent-gateway` prints help rather than blocking on a prompt.
@@ -1284,22 +1331,51 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         build_parser().print_help()
         return 0
 
-    sys.stderr.write(ux.banner("agent-gateway launcher", width=64) + "\n")
+    # --- the box: what is running, where ------------------------------------
+    services = detect_local_services()
+    if "antigravity" in services:
+        status = "Antigravity bridge detected on :8080"
+    elif "ollama" in services:
+        status = "Ollama detected on :11434"
+    else:
+        status = "no local bridge detected -- commercial APIs available"
+    sys.stderr.write(ux.bold(wizard_banner(status), stream=sys.stderr) + "\n")
 
-    agent = choose("\nWhich agent are you using?\n", WIZARD_AGENTS, input_fn)
-    strategy = choose(
-        "\nWhich routing & classifier strategy do you want?\n",
-        WIZARD_STRATEGIES,
-        input_fn,
+    # --- step 1: the agent ---------------------------------------------------
+    sys.stderr.write(
+        ux.dim("\n── Step 1 · Choose Agent ─────────────────────────────", stream=sys.stderr)
+        + "\n"
     )
+    agent = choose("", WIZARD_AGENTS, input_fn)
 
     env_path = Path.cwd() / ".env"
     existing = read_env_file(env_path)
 
-    # --- upstream: free tier first, the paid tier behind one extra step -----
-    provider = choose_upstream(input_fn)
+    # --- step 2: the upstream ------------------------------------------------
+    sys.stderr.write(
+        ux.dim(
+            "\n── Step 2 · Choose Upstream Provider ─────────────────",
+            stream=sys.stderr,
+        )
+        + "\n"
+    )
+    sys.stderr.write(
+        ux.dim("  $0 per token -- flat-rate subscriptions & local engines:\n", stream=sys.stderr)
+    )
+    for number, _key, label in WIZARD_SUBSCRIPTION_UPSTREAMS:
+        sys.stderr.write(f"    [{number}] {label}\n")
+    sys.stderr.write(ux.dim("  paid -- metered per-token APIs:\n", stream=sys.stderr))
+    for number, _key, label in WIZARD_COMMERCIAL_UPSTREAMS:
+        sys.stderr.write(f"    [{number}] {label}\n")
+
+    provider = ""
+    while provider not in {key for _n, key, _l in WIZARD_UPSTREAMS}:
+        raw = input_fn("Select 1-4 [1]: ").strip() or "1"
+        provider = next(
+            (key for number, key, _l in WIZARD_UPSTREAMS if raw == number), ""
+        )
     if provider == "commercial":
-        provider = choose("\nWhich commercial provider?\n", WIZARD_COMMERCIAL, input_fn)
+        provider = choose("\nWhich commercial provider?", WIZARD_COMMERCIAL, input_fn)
 
     existing_key = existing.get("UPSTREAM_API_KEY", "")
     anthropic_surface = provider == "claude_session"
@@ -1349,6 +1425,26 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         if note:
             sys.stderr.write("\n" + ux.cyan(note, stream=sys.stderr) + "\n")
 
+    # --- step 3: the routing engine -----------------------------------------
+    sys.stderr.write(
+        ux.dim(
+            "\n── Step 3 · Routing & Pruning Engine ─────────────────",
+            stream=sys.stderr,
+        )
+        + "\n"
+    )
+    for number, _key, label in WIZARD_ENGINES:
+        sys.stderr.write(f"    [{number}] {label}\n")
+    sys.stderr.write(ux.dim("  advanced:\n", stream=sys.stderr))
+    for number, _key, label in WIZARD_ADVANCED_ENGINES:
+        sys.stderr.write(f"    [{number}] {label}\n")
+    strategy = ""
+    while strategy not in {key for _n, key, _l in WIZARD_STRATEGIES}:
+        raw = input_fn("Select 1-5 [2]: ").strip() or "2"
+        strategy = next(
+            (key for number, key, _l in WIZARD_STRATEGIES if raw == number), ""
+        )
+
     # `external_jev` is the one strategy that needs its own classifier endpoint.
     classifier_url = ""
     classifier_key = ""
@@ -1364,9 +1460,15 @@ def cmd_interactive(args: argparse.Namespace) -> int:
             "Classifier API key (blank keeps the existing key): "
         ).strip()
 
-    suggested = suggest_port()
-    raw = input_fn(f"Gateway port [{suggested}]: ").strip()
-    port = int(raw) if raw.isdigit() else suggested
+    # --- the port is not a question -----------------------------------------
+    # Silent by default: 8090 when free, 8091 when 8080/8090 are busy, and only
+    # `--port` (or an existing .env port) overrides without asking.
+    if forced_port:
+        port = int(forced_port)
+    elif existing.get("GATEWAY_PORT", "").isdigit():
+        port = int(existing["GATEWAY_PORT"])
+    else:
+        port = suggest_port()
 
     preset = build_wizard_preset(
         agent,
@@ -1382,6 +1484,9 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     update_env_file(env_path, preset)
     os.environ.update({key: str(value) for key, value in preset.items()})
 
+    # --- shim self-heal -------------------------------------------------------
+    # The global wrapper is what makes `agent-gateway` work from any directory;
+    # a missing or unreadable one is rewritten here rather than complained about.
     try:
         shim = install_global_wrapper()
         hint = f"[{shim.parent}]"
@@ -1391,7 +1496,15 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         hint = f"(could not write the global wrapper: {exc})"
 
     sys.stderr.write(
-        ux.green("\nsetup saved to " + str(env_path), stream=sys.stderr) + "\n"
+        ux.green("\n✔ setup saved to " + str(env_path), stream=sys.stderr) + "\n"
+    )
+    sys.stderr.write(
+        ux.dim(
+            f"  agent → {agent} · upstream → {upstream_url} · "
+            f"engine → {strategy} · port → {port}",
+            stream=sys.stderr,
+        )
+        + "\n"
     )
     sys.stderr.write(ux.dim("agent-gateway wrapper: " + hint, stream=sys.stderr) + "\n")
 
@@ -1510,6 +1623,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     interactive.add_argument(
         "--no-launch", dest="launch", action="store_false", help=argparse.SUPPRESS
+    )
+    interactive.add_argument(
+        "--port", type=int, default=None, help="override the gateway port (skipped silently otherwise)"
     )
     interactive.set_defaults(func=cmd_interactive)
 
