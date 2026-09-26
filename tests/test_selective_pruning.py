@@ -25,7 +25,7 @@ from src.config import (
     SELECTIVE_PRUNING_MIN_TOOLS,
     load_settings,
 )
-from src.gateway import apply_selective_pruning, create_app
+from src.gateway import apply_selective_pruning, create_app, prune_for_tool_loop
 
 import httpx
 import pytest
@@ -442,6 +442,25 @@ async def test_gateway_caps_an_arabic_prompt_to_five_tools(
     assert "bash" in sent and "read_file" in sent
 
 
+def _toolloop_messages(tool_name: str = "web_search") -> list:
+    """A conversation sitting mid tool-call, waiting on one result."""
+    return [
+        {"role": "user", "content": "search the web for tutorials"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "results"},
+    ]
+
+
 async def test_tool_turn_does_not_expand_back_to_the_full_catalog(
     settings, store, memory, mock_state
 ):
@@ -482,3 +501,74 @@ async def test_tool_turn_does_not_expand_back_to_the_full_catalog(
     assert response.status_code == 200
     after = int(response.headers["x-proxy-tools-after"])
     assert after <= 5, "a tool turn must not re-expand the catalog"
+
+
+async def test_tool_loop_keeps_the_active_tool_inside_the_cap(
+    settings, store, memory, mock_state
+):
+    """The tool the upstream is mid-call on must survive the ceiling."""
+    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
+    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gw", timeout=30.0
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "stream": True,
+                "messages": _toolloop_messages("web_search"),
+                "tools": big_toolset(49),
+            },
+        )
+
+    assert response.status_code == 200
+    after = int(response.headers["x-proxy-tools-after"])
+    assert after <= 5, "the ToolLoop ceiling is absolute, even for 49 tools"
+    sent = [tool["function"]["name"] for tool in mock_state.bodies[-1]["tools"]]
+    assert "web_search" in sent, "the pending call's tool must stay offered"
+    for name in sent:
+        assert name == "web_search" or name in CORE_TOOLS
+
+
+def test_prune_for_tool_loop_strictly_caps_to_five_tools():
+    tools = big_toolset(49)
+    kept, dropped = prune_for_tool_loop(tools, active_tools=["spotify_play"], limit=5)
+    assert len(kept) <= 5
+    assert dropped == 44
+    kept_names = names(kept)
+    assert "spotify_play" in kept_names
+    for name in kept_names:
+        assert name == "spotify_play" or name in CORE_TOOLS
+
+
+def test_apply_selective_pruning_must_keep_never_overflows_the_limit():
+    settings = load_settings(env={"SELECTIVE_TOOL_LIMIT": "5"})
+    tools = big_toolset(49)
+
+    kept, dropped = apply_selective_pruning(
+        settings, "unrelated prompt about penguins", tools, must_keep=["spotify_play"]
+    )
+
+    assert len(kept) <= 5
+    assert dropped == len(tools) - len(kept)
+    assert "spotify_play" in names(kept), "the pending call's tool is displaced in, not appended past the cap"
+
+
+def test_apply_selective_pruning_requires_never_shrinks_below_the_cap():
+    settings = load_settings(env={"SELECTIVE_TOOL_LIMIT": "5"})
+    tools = big_toolset(49)
+
+    kept, _ = apply_selective_pruning(
+        settings,
+        "send an email to alice about the meeting",
+        tools,
+        must_keep=["send_email", "calendar_create", "sql_query", "image_generate", "weather"],
+    )
+
+    assert len(kept) <= 5
+    kept_names = set(names(kept))
+    assert {"send_email", "calendar_create"} <= kept_names
+    assert "send_email" in kept_names

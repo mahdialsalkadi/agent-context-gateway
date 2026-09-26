@@ -584,6 +584,21 @@ def test_jev_payload_asks_for_one_token_with_logprobs():
     assert "A. Yes" in content and "B. No" in content
 
 
+def test_jev_payload_switches_to_raw_completions_for_a_completion_url():
+    """A /completions URL gets the prompt verbatim, bypassing any chat template."""
+    settings = load_settings(
+        env={
+            "CLASSIFIER_MODE": "local_jev",
+            "LOCAL_JEV_URL": "http://127.0.0.1:11435/v1/completions",
+        }
+    )
+    payload = Classifier(settings)._build_jev_payload("do the thing", "Does it matter?")
+
+    assert "messages" not in payload
+    assert payload["prompt"].startswith("You are a decision function")
+    assert payload["cache_prompt"] is True
+
+
 def test_parse_jev_logprobs_computes_the_softmax():
     data = {
         "choices": [
@@ -649,8 +664,9 @@ async def test_local_jev_classifies_from_the_first_token_logprobs(monkeypatch):
     assert seen["url"].endswith(":11435/v1/chat/completions")
     assert seen["payload"]["max_tokens"] == 1
     assert seen["payload"]["logprobs"] is True
-    # The whole point of a 2B local model: a hard latency budget.
-    assert seen["timeout"] is not None and seen["timeout"] <= 0.4
+    # The whole point of a 2B local model: a hard latency budget, generous
+    # enough that long prompts get a real verdict instead of an eager fail-open.
+    assert seen["timeout"] is not None and seen["timeout"] <= 0.8
 
 
 async def test_local_jev_fails_open_when_the_endpoint_is_unreachable(monkeypatch, settings):
@@ -707,9 +723,9 @@ async def test_local_jev_resolves_memory_conflicts_with_the_supersede_question(m
     assert "supersede" in seen["prompt"].lower()
 
 
-def test_local_jev_timeout_defaults_to_0_4_and_is_configurable():
+def test_local_jev_timeout_defaults_to_0_8_and_is_configurable():
     default = load_settings(env={"CLASSIFIER_MODE": "local_jev"})
-    assert default.local_jev_timeout == 0.4
+    assert default.local_jev_timeout == 0.8
 
     tuned = load_settings(
         env={"CLASSIFIER_MODE": "local_jev", "LOCAL_JEV_TIMEOUT_SECONDS": "1.5"}

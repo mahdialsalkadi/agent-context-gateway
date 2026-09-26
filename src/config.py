@@ -61,10 +61,12 @@ DEFAULT_OLLAMA_CLASSIFIER_MODEL = "qwen2.5:0.5b"
 # request, so a verdict is a single forward pass and needs no API key.
 DEFAULT_LOCAL_JEV_URL = "http://127.0.0.1:11435/v1/chat/completions"
 DEFAULT_LOCAL_JEV_MODEL = "jev-style-qwen3.5-2b-q8_0"
-# Verdict budget for the local GGUF. A GPU-offloaded server (`-ngl 99`) is fast
-# enough that 0.4s is generous; a CPU-only host can raise it, at the cost of
-# waiting longer before falling back to the local heuristics.
-DEFAULT_LOCAL_JEV_TIMEOUT = 0.4
+# Verdict budget for the local GGUF. The default is deliberately generous: a
+# GPU-resident server (`-ngl 99 --keep -1`) answers in tens of milliseconds, but
+# long prompts still need a KV-cache prefill, and the point of the mode is a
+# real verdict -- not an eager bail-out to `Classifier-FailOpen`. Raise it
+# further on a CPU-only host.
+DEFAULT_LOCAL_JEV_TIMEOUT = 0.8
 
 DEFAULT_TRUNCATE_CHARS = 800
 DEFAULT_SNIFF_LIMIT = 512

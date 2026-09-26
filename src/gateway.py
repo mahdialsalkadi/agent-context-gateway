@@ -53,6 +53,7 @@ from .bridge import (
     translate_stream,
 )
 from .classifier import (
+    CORE_TOOLS,
     ESCAPE_TOKEN,
     Classifier,
     decide_route,
@@ -69,7 +70,12 @@ from .config import (
     load_settings,
 )
 from .memory import GraphMemory, get_memory
-from .messages import last_user_text, normalize_messages, text_of
+from .messages import (
+    iter_tool_call_refs,
+    last_user_text,
+    normalize_messages,
+    text_of,
+)
 
 # ------------------------------------------------------------------------------
 # Upstream auth
@@ -186,7 +192,10 @@ async def _close_quietly(
 
 
 def apply_selective_pruning(
-    settings: Settings, prompt: str, tools: List[Dict[str, Any]]
+    settings: Settings,
+    prompt: str,
+    tools: List[Dict[str, Any]],
+    must_keep: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Shrink a large tool schema to the tools this turn can actually need.
 
@@ -195,6 +204,11 @@ def apply_selective_pruning(
     `rank_tools` is called in hard-cap mode, so no prompt -- including one in a
     language BM25 cannot read -- can return the whole catalog, and the result is
     always `<= settings.selective_tool_limit`.
+
+    `must_keep` names tools the conversation is already mid-call on (a tool
+    turn). They are guaranteed inside the ceiling -- displacing the weakest
+    ranked pick, never overflowing it -- so the model always receives the schema
+    it is about to be answered for.
     """
     if (
         not settings.enable_selective_pruning
@@ -206,10 +220,115 @@ def apply_selective_pruning(
         kept = rank_tools(
             prompt, tools, settings.selective_tool_limit, hard_cap=True
         )
+        if must_keep:
+            kept = _ensure_present(kept, tools, must_keep, settings.selective_tool_limit)
     except Exception:
         return tools, 0
     if len(kept) >= len(tools):
         return tools, 0
+    return kept, len(tools) - len(kept)
+
+
+def _tool_name(tool: Any) -> str:
+    """The tool's name in either the OpenAI or Anthropic payload shape."""
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(tool.get("name") or "")
+
+
+def _ensure_present(
+    kept: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    must_keep: List[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Fold `must_keep` into `kept` without ever exceeding `limit` entries.
+
+    A pending call the upstream is mid-answer on outranks every heuristic: if it
+    was displaced by the ranker, the weakest non-required tool gives way. Order
+    follows the original payload so prompt caches stay warm.
+    """
+    required = {name for name in must_keep if name}
+    if not required:
+        return kept
+    kept_names = {_tool_name(tool) for tool in kept}
+    missing = [name for name in must_keep if name not in kept_names]
+    if not missing:
+        return kept
+
+    result = list(kept)
+    for name in missing:
+        if any(_tool_name(tool) == name for tool in result):
+            continue
+        source = next(
+            (tool for tool in tools if _tool_name(tool) == name), None
+        )
+        if source is None:
+            continue
+        if len(result) < limit:
+            result.append(source)
+            continue
+        # Displace the weakest entry that is not itself required.
+        for index in reversed(range(len(result))):
+            if _tool_name(result[index]) not in required:
+                result[index] = source
+                break
+    # Restore payload order for the returned subset.
+    kept_order = {_tool_name(tool): index for index, tool in enumerate(tools)}
+    result.sort(key=lambda tool: kept_order.get(_tool_name(tool), len(tools)))
+    return result
+
+
+def prune_for_tool_loop(
+    tools: List[Dict[str, Any]],
+    active_tools: List[str],
+    limit: int = 5,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Hard-cap the tools in ToolLoop strictly to <= 5 tools (active tool + CORE_TOOLS).
+
+    Ensures requests in a multi-turn tool cycle (`role: "tool"`) NEVER leak the full
+    catalog (49 tools).
+    """
+    if not isinstance(tools, list) or not tools:
+        return tools, 0
+    if len(tools) <= limit:
+        return tools, 0
+
+    tool_by_name = {_tool_name(t): t for t in tools}
+
+    # 1. Active tool(s) first
+    selected_names: List[str] = []
+    for name in active_tools:
+        if name in tool_by_name and name not in selected_names:
+            selected_names.append(name)
+            if len(selected_names) >= limit:
+                break
+
+    # 2. CORE_TOOLS to fill up to limit
+    if len(selected_names) < limit:
+        for tool in tools:
+            name = _tool_name(tool)
+            if name in CORE_TOOLS and name not in selected_names:
+                selected_names.append(name)
+                if len(selected_names) >= limit:
+                    break
+
+    # 3. Fallback to remaining tools if still fewer than limit
+    if len(selected_names) < limit:
+        for tool in tools:
+            name = _tool_name(tool)
+            if name not in selected_names:
+                selected_names.append(name)
+                if len(selected_names) >= limit:
+                    break
+
+    kept = [tool_by_name[name] for name in selected_names if name in tool_by_name]
+    # Preserve original order from tools list for cache stability
+    order = {_tool_name(t): i for i, t in enumerate(tools)}
+    kept.sort(key=lambda t: order.get(_tool_name(t), len(tools)))
     return kept, len(tools) - len(kept)
 
 
@@ -558,14 +677,25 @@ def create_app(
         # Must precede the all-or-nothing strip so a stripped turn cannot rank.
         # Note the absence of `not is_tool_turn`: a mid-loop turn must not
         # silently expand back to the full catalog just because the model is
-        # waiting on a result. The cap is unconditional.
+        # waiting on a result. The cap is unconditional: on a tool turn it
+        # hard-caps strictly to <= 5 tools (active tool + CORE_TOOLS), ensuring a
+        # 49-tool catalog can never leak through a multi-turn tool cycle.
         selective_count = 0
         if (
             has_tools
             and not decision.stripped
             and body.get("tool_choice") in (None, "auto")
         ):
-            tools, selective_count = apply_selective_pruning(cfg(), prompt, tools)
+            if is_tool_turn:
+                pending: List[str] = []
+                for name, _args in iter_tool_call_refs(messages).values():
+                    if name and name not in pending:
+                        pending.append(name)
+                tools, selective_count = prune_for_tool_loop(
+                    tools, pending, limit=min(5, cfg().selective_tool_limit or 5)
+                )
+            else:
+                tools, selective_count = apply_selective_pruning(cfg(), prompt, tools)
             if selective_count:
                 body["tools"] = tools
                 has_tools = bool(tools)
@@ -604,12 +734,13 @@ def create_app(
             audit({
                 "req_id": req_id, "surface": "openai", "route": route,
                 "tool_action": tool_action, "spill_count": spill_count,
+                "tools_before": tools_before, "tools_after": tools_sent(),
                 "latency_ms": round(elapsed, 2), "error": str(exc),
             })
             return JSONResponse(
                 {"error": {"message": f"Upstream unreachable: {exc}", "type": "upstream_error"}},
                 status_code=502,
-                headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted),
+                headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted, (tools_before, tools_sent())),
             )
 
         if upstream.status_code >= 400:
@@ -618,6 +749,7 @@ def create_app(
             audit({
                 "req_id": req_id, "surface": "openai", "route": route,
                 "tool_action": tool_action, "spill_count": spill_count,
+                "tools_before": tools_before, "tools_after": tools_sent(),
                 "latency_ms": round(elapsed, 2), "upstream_status": upstream.status_code,
             })
             return StreamingResponse(
@@ -625,7 +757,7 @@ def create_app(
                     upstream, client, upstream.aiter_raw(), bg, session_id, prompt, None
                 ),
                 status_code=upstream.status_code,
-                headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted),
+                headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted, (tools_before, tools_sent())),
             )
 
         # 6. Bounded escape look-ahead on the pruned route.
@@ -778,12 +910,15 @@ def create_app(
         forced_tools = translated.get("tool_choice") in ("required",) or isinstance(
             translated.get("tool_choice"), dict
         )
-        prompt = last_user_text(normalize_messages(translated))
+        norm_messages = normalize_messages(translated)
+        last_role = norm_messages[-1].get("role") if norm_messages else ""
+        is_tool_turn = last_role in ("tool", "function", "tool_call")
+        prompt = last_user_text(norm_messages)
         tools = translated.get("tools")
         has_tools = isinstance(tools, list) and bool(tools)
 
         decision = await decide_route(
-            cfg(), klass(), model, prompt, has_tools, is_tool_turn=False
+            cfg(), klass(), model, prompt, has_tools, is_tool_turn=is_tool_turn
         )
         # Never prune when the caller demanded a specific tool.
         if forced_tools and decision.stripped:
@@ -796,7 +931,16 @@ def create_app(
         # forwarded whole. Skipped for an explicit tool choice and for an
         # all-or-nothing strip, which removes the schema entirely.
         if has_tools and not forced_tools and not decision.stripped:
-            pruned, dropped = apply_selective_pruning(cfg(), prompt, tools)
+            if is_tool_turn:
+                pending = []
+                for name, _args in iter_tool_call_refs(norm_messages).values():
+                    if name and name not in pending:
+                        pending.append(name)
+                pruned, dropped = prune_for_tool_loop(
+                    tools, pending, limit=min(5, cfg().selective_tool_limit or 5)
+                )
+            else:
+                pruned, dropped = apply_selective_pruning(cfg(), prompt, tools)
             if dropped:
                 translated["tools"] = pruned
                 tools = pruned

@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -102,10 +103,11 @@ JEV_NEEDS_TOOLS_QUESTION = (
 )
 JEV_SUPERSEDE_QUESTION = "Does the new value supersede the existing value?"
 
-# Default verdict budget for the local GGUF. A GPU-offloaded server (`-ngl 99`)
-# clears this easily; it stays tunable with LOCAL_JEV_TIMEOUT_SECONDS so a
-# CPU-only host can wait longer before failing open to the local heuristics.
-LOCAL_JEV_TIMEOUT_SECONDS = 0.4
+# Default verdict budget for the local GGUF. Generous on purpose: the mode's
+# value is a real verdict, so the budget covers a cold KV-cache prefill on long
+# prompts rather than bailing out at the first hiccup. Tunable with
+# LOCAL_JEV_TIMEOUT_SECONDS; latency spikes are logged, not silently swallowed.
+LOCAL_JEV_TIMEOUT_SECONDS = 0.8
 
 
 def is_reasoning_model(
@@ -538,7 +540,7 @@ class Classifier:
       a verdict costs nothing beyond the subscription already in use.
     * `local_ollama`    -- a local runner; same OpenAI payload shape, no internet.
     * `local_jev`       -- the Jev-Style Qwen3.5-2B GGUF on llama-server. One
-      forward pass, one letter, read from `logprobs` in under 400ms.
+      forward pass, one letter, read from `logprobs` well inside the budget.
     * `external_jev`    -- a dedicated endpoint (OpenRouter/OpenCode), where the
       `blueprint` protocol is also available.
 
@@ -582,12 +584,29 @@ class Classifier:
         if self.settings.classifier_api_key:
             headers["Authorization"] = f"Bearer {self.settings.classifier_api_key}"
         effective_timeout = self.settings.classifier_timeout if timeout is None else timeout
+        started = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=effective_timeout) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     return None
-                return response.json()
+                data = response.json()
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                budget_ms = effective_timeout * 1000
+                # A slow verdict is still a verdict: log the spike and keep the
+                # answer rather than discarding it for being late.
+                if elapsed_ms > max(500.0, budget_ms / 2):
+                    sys.stderr.write(
+                        f"[classifier] slow verdict: {elapsed_ms:.0f}ms "
+                        f"(budget {budget_ms:.0f}ms) -- keeping the result\n"
+                    )
+                return data
+        except httpx.TimeoutException:
+            sys.stderr.write(
+                f"[classifier] verdict timed out after {effective_timeout:.2f}s "
+                "-- failing open\n"
+            )
+            return None
         except Exception:
             return None
 
@@ -627,13 +646,14 @@ class Classifier:
 
     def _build_jev_payload(self, state: str, question: str) -> Dict[str, Any]:
         """One-letter decision payload for the local Jev GGUF."""
-        return {
+        payload: Dict[str, Any] = {
             "model": self.settings.classifier_model,
             "temperature": 0,
             "max_tokens": 1,
             "logprobs": True,
             "top_logprobs": 10,
             "stream": False,
+            "cache_prompt": True,
             "messages": [
                 {
                     "role": "user",
@@ -643,6 +663,18 @@ class Classifier:
                 }
             ],
         }
+        # A base URL pointing at llama-server's *raw* completion endpoint
+        # (…/v1/completions, i.e. not the chat path) receives the decision
+        # prompt verbatim: no chat template can inject its own preamble and
+        # shift the answer distribution, and `cache_prompt` keeps the KV cache
+        # warm across the repeated verdicts of a session.
+        if self.settings.classifier_api_url.rstrip("/").endswith(
+            "/v1/completions"
+        ):
+            payload["prompt"] = payload["messages"][0]["content"]
+            payload["cache_prompt"] = True
+            del payload["messages"]
+        return payload
 
     async def classify_via_local_jev(
         self,

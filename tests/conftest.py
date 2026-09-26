@@ -15,16 +15,42 @@ import tempfile
 import httpx
 import pytest
 
-# --- hermetic HOME -----------------------------------------------------------
+# --- hermetic HOME + hermetic environment ------------------------------------
 # `src.gateway` resolves settings at import time, and `load_env_file` only fills
-# in defaults. A developer's real `~/.agent-gateway/.env` (or an installed
-# wrapper) would therefore leak into every test and silently override the
-# shipped profile files. Point HOME at a scratch directory before importing any
-# project module, then restore it when the session ends.
+# in defaults via os.environ.setdefault. Two real-world leaks would therefore
+# reach every test: a developer's `~/.agent-gateway/.env` (via HOME) and the
+# repo's own `.env` — which lives at the *project root*, unaffected by HOME, and
+# is picked up when `src.gateway`'s import-time `create_app()` loads the default
+# env file. Values already in os.environ outrank every profile a test loads, so
+# both are purged here: point HOME at a scratch directory AND strip anything a
+# real `.env` may have injected, before importing any project module.
 _TEST_HOME = tempfile.mkdtemp(prefix="agent-gateway-test-home-")
 _ORIGINAL_HOME = os.environ.get("HOME")
 os.environ["HOME"] = _TEST_HOME
 os.environ["USERPROFILE"] = _TEST_HOME
+
+# Keys a real `.env` can inject and that a test's settings resolution must never
+# inherit. Purged before the imports (they would otherwise be seen by the
+# import-time create_app), after the imports (its load_env_file re-injects them),
+# and around every test (code under test can re-load the file mid-session).
+_REAL_ENV_KEYS = (
+    "GATEWAY_HOST",
+    "GATEWAY_PORT",
+    "CLASSIFIER_MODE",
+    "CLASSIFIER_MODEL",
+    "CLASSIFIER_API_URL",
+    "CLASSIFIER_API_KEY",
+    "UPSTREAM_BASE_URL",
+    "UPSTREAM_API_KEY",
+    "LOCAL_JEV_URL",
+    "LOCAL_JEV_TIMEOUT_SECONDS",
+    "ALLOW_LEGACY_UPSTREAM_PORT",
+    "AGENT_GATEWAY_PROFILE",
+    "OLLAMA_BASE_URL",
+)
+
+for _leaked in _REAL_ENV_KEYS:
+    os.environ.pop(_leaked, None)
 
 from src.artifacts import ArtifactStore
 from src.classifier import Classifier
@@ -32,6 +58,21 @@ from src.config import Settings
 from src.gateway import create_app
 from src.memory import GraphMemory
 from tests.mock_upstream import MockState, start_mock_upstream
+
+# `src.gateway`'s import-time create_app() ran load_env_file() AFTER the strip
+# above, re-injecting the real .env's values. Purge again now imports are done.
+for _leaked in _REAL_ENV_KEYS:
+    os.environ.pop(_leaked, None)
+
+
+@pytest.fixture(autouse=True)
+def _purge_real_env():
+    """Keep the developer's real .env out of every test's settings resolution."""
+    for key in _REAL_ENV_KEYS:
+        os.environ.pop(key, None)
+    yield
+    for key in _REAL_ENV_KEYS:
+        os.environ.pop(key, None)
 
 
 @pytest.fixture(scope="session", autouse=True)
