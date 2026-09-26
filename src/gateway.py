@@ -1243,6 +1243,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         probe.close()
 
+    import signal
+    import threading
+
+    try:
+        signal.signal(signal.SIGHUP, lambda s, f: os.kill(os.getpid(), signal.SIGTERM))
+    except Exception:
+        pass
+
+    owner_pid_str = os.environ.get("AGENT_GATEWAY_OWNER_PID")
+    if owner_pid_str and owner_pid_str.isdigit():
+        owner_pid = int(owner_pid_str)
+
+        def _watchdog_loop() -> None:
+            while True:
+                time.sleep(0.3)
+                try:
+                    os.kill(owner_pid, 0)
+                except OSError:
+                    # Owner process terminated (e.g. terminal window closed)
+                    try:
+                        if settings.effective_classifier_mode == "local_jev":
+                            from .jev_lifecycle import stop_local_jev
+
+                            stop_local_jev(settings)
+                    finally:
+                        os._exit(0)
+
+        t = threading.Thread(target=_watchdog_loop, name="owner-watchdog", daemon=True)
+        t.start()
+
     try:
         uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
     finally:

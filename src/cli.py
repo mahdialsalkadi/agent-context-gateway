@@ -197,6 +197,14 @@ def _tail(path: Path, lines: int) -> str:
         return "(log unavailable)"
 
 
+def _safe_stderr(text: str) -> None:
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     from .config import load_settings
 
@@ -210,18 +218,18 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not _pid_alive(pid):
         _clear_pid()
         if _probe_health(timeout=1.0) is not None:
-            sys.stderr.write(
+            _safe_stderr(
                 "[cli] something answers on the port, but it was not started by "
                 "this CLI; refusing to signal a PID we did not record.\n"
             )
             return 1
-        sys.stderr.write("[cli] gateway is not running.\n")
+        _safe_stderr("[cli] gateway is not running.\n")
         return 0
 
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:
-        sys.stderr.write(f"[cli] could not signal pid {pid}: {exc}\n")
+        _safe_stderr(f"[cli] could not signal pid {pid}: {exc}\n")
         return 1
 
     deadline = time.time() + 8.0
@@ -232,7 +240,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         time.sleep(0.3)
 
     _clear_pid()
-    sys.stderr.write(f"[cli] gateway stopped (pid {pid}).\n")
+    _safe_stderr(f"[cli] gateway stopped (pid {pid}).\n")
     return 0
 
 
@@ -392,7 +400,7 @@ def _gateway_healthy() -> bool:
     return str(health.get("data_dir") or "") == str(load_settings().data_dir)
 
 
-def _ensure_gateway_running() -> int:
+def _ensure_gateway_running(owner_pid: Optional[int] = None) -> int:
     """Start the daemon if needed; return 0 when a healthy gateway is up."""
     if _gateway_healthy():
         return 0
@@ -406,6 +414,8 @@ def _ensure_gateway_running() -> int:
     # on our configured port/data_dir, stop the stale/misconfigured process first.
     if _pid_alive(_read_pid()):
         cmd_stop(argparse.Namespace())
+    if owner_pid is not None:
+        os.environ["AGENT_GATEWAY_OWNER_PID"] = str(owner_pid)
     namespace = argparse.Namespace(daemon=True, profile="", port=None)
     if cmd_start(namespace) != 0:
         raise CliError(
@@ -933,7 +943,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     settings = load_settings()
 
-    _ensure_gateway_running()
+    _ensure_gateway_running(owner_pid=os.getpid())
     sys.stderr.write(
         ux.dim(
             f"[run] gateway ready on :{settings.port} -- launching {spec['binary']}\n",
@@ -950,13 +960,53 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     import atexit
 
+    proc: Optional[subprocess.Popen] = None
+
     def _cleanup():
-        cmd_stop(argparse.Namespace())
+        nonlocal proc
+        # Closed terminal PTY or broken pipe must never abort cleanup:
+        try:
+            devnull = open(os.devnull, "w")
+            sys.stdout = devnull
+            sys.stderr = devnull
+        except Exception:
+            pass
+
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            cmd_stop(argparse.Namespace())
+        except Exception:
+            pass
+
+    def _signal_handler(signum, frame):
+        _cleanup()
+        sys.exit(128 + signum)
+
+    old_hup = None
+    old_term = None
+    try:
+        old_hup = signal.signal(signal.SIGHUP, _signal_handler)
+    except Exception:
+        pass
+    try:
+        old_term = signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception:
+        pass
 
     atexit.register(_cleanup)
     try:
-        completed = subprocess.run(command, env=environment)
+        proc = subprocess.Popen(command, env=environment)
+        completed_code = proc.wait()
     except KeyboardInterrupt:
+        _cleanup()
         return 130
     finally:
         _cleanup()
@@ -964,7 +1014,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             atexit.unregister(_cleanup)
         except Exception:
             pass
-    return completed.returncode
+        if old_hup is not None:
+            try:
+                signal.signal(signal.SIGHUP, old_hup)
+            except Exception:
+                pass
+        if old_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, old_term)
+            except Exception:
+                pass
+    return completed_code
 
 
 # ------------------------------------------------------------------------------

@@ -80,6 +80,14 @@ def _find_jev_model_path() -> Optional[Path]:
     return None
 
 
+def _safe_stderr(msg: str) -> None:
+    try:
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def ensure_local_jev_running(settings: Settings, wait_seconds: float = 8.0) -> bool:
     """Start the local Jev llama-server if it is not already running."""
     if settings.effective_classifier_mode != CLASSIFIER_MODE_LOCAL_JEV:
@@ -89,7 +97,7 @@ def ensure_local_jev_running(settings: Settings, wait_seconds: float = 8.0) -> b
     if probe_local_jev(url, timeout=0.8):
         return True
 
-    sys.stderr.write("[jev] starting local Jev decision server on Vulkan GPU...\n")
+    _safe_stderr("[jev] starting local Jev decision server on Vulkan GPU...\n")
 
     # Strategy 1: systemd --user service if available
     has_systemd_service = False
@@ -154,11 +162,11 @@ def ensure_local_jev_running(settings: Settings, wait_seconds: float = 8.0) -> b
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         if probe_local_jev(url, timeout=0.5):
-            sys.stderr.write("[jev] local Jev server ready (Vulkan GPU resident)\n")
+            _safe_stderr("[jev] local Jev server ready (Vulkan GPU resident)\n")
             return True
         time.sleep(0.25)
 
-    sys.stderr.write("[jev] warning: local Jev server did not report ready in time\n")
+    _safe_stderr("[jev] warning: local Jev server did not report ready in time\n")
     return False
 
 
@@ -167,7 +175,7 @@ def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
     if settings.effective_classifier_mode != CLASSIFIER_MODE_LOCAL_JEV:
         return True
 
-    sys.stderr.write("[jev] stopping local Jev decision server (releasing VRAM)...\n")
+    _safe_stderr("[jev] stopping local Jev decision server (releasing VRAM)...\n")
 
     # 1. Stop systemd service if available
     try:
@@ -228,9 +236,9 @@ def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         if not probe_local_jev(url, timeout=0.3):
-            sys.stderr.write("[jev] local Jev server stopped (VRAM freed)\n")
+            _safe_stderr("[jev] local Jev server stopped (VRAM freed)\n")
             return True
         time.sleep(0.2)
 
-    sys.stderr.write("[jev] warning: local Jev port still responsive after stop\n")
+    _safe_stderr("[jev] warning: local Jev port still responsive after stop\n")
     return False
