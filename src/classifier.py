@@ -321,7 +321,7 @@ async def route_tools_via_jev(
         ],
     }
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
     if cfg.classifier_api_key:
         headers["Authorization"] = f"Bearer {cfg.classifier_api_key}"
 

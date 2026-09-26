@@ -395,10 +395,16 @@ def create_app(
             headers["X-Proxy-Tools-After"] = str(after)
         return headers
 
+    def _iter_bytes(response: httpx.Response) -> AsyncIterator[bytes]:
+        """Yield decompressed chunks if encoded, or raw bytes if unencoded."""
+        if hasattr(response, "aiter_bytes"):
+            return response.aiter_bytes()
+        return response.aiter_raw()
+
     def upstream_request(
         client: httpx.AsyncClient, body: Dict[str, Any], client_auth: str = ""
     ) -> httpx.Request:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
         auth = upstream_auth_header(cfg().upstream_api_key, client_auth)
         if auth:
             headers["Authorization"] = auth
@@ -523,7 +529,7 @@ def create_app(
                 return openai_error(f"Upstream unreachable: {exc}", 502, "upstream_error")
             elapsed = (time.perf_counter() - started) * 1000
             return StreamingResponse(
-                stream_and_tap(upstream, client, upstream.aiter_raw(), bg, "bypass", "", None),
+                stream_and_tap(upstream, client, _iter_bytes(upstream), bg, "bypass", "", None),
                 status_code=upstream.status_code,
                 headers=telemetry(route, tool_action, elapsed, 0, req_id),
             )
@@ -696,7 +702,7 @@ def create_app(
             })
             return StreamingResponse(
                 stream_and_tap(
-                    upstream, client, upstream.aiter_raw(), bg, session_id, prompt, None
+                    upstream, client, _iter_bytes(upstream), bg, session_id, prompt, None
                 ),
                 status_code=upstream.status_code,
                 headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted, (tools_before, tools_sent())),
@@ -705,7 +711,7 @@ def create_app(
         # 6. Bounded escape look-ahead on the pruned route.
         # The stream is created exactly once here: httpx allows a single pass, so
         # the sniff must leave the iterator positioned for the relay below.
-        iterator: AsyncIterator[bytes] = upstream.aiter_raw()
+        iterator: AsyncIterator[bytes] = _iter_bytes(upstream)
         prefetched: Optional[List[bytes]] = None
         decision_stripped = tool_action.startswith("Stripped") or bool(created_escape_message)
         if decision_stripped:
@@ -756,7 +762,7 @@ def create_app(
                         status_code=502,
                         headers=telemetry(route, tool_action, elapsed, spill_count, req_id, intercepted),
                     )
-                iterator = upstream.aiter_raw()
+                iterator = _iter_bytes(upstream)
                 prefetched = None
 
         elapsed = (time.perf_counter() - started) * 1000
@@ -1005,7 +1011,7 @@ def create_app(
 
             try:
                 async for frame in translate_stream(
-                    upstream.aiter_raw(),
+                    _iter_bytes(upstream),
                     model,
                     input_tokens,
                     observe,
