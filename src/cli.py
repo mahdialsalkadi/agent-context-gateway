@@ -420,12 +420,12 @@ def detect_local_services(timeout: float = 0.8) -> dict:
     """Probe the standard local model-server ports.
 
     Used by `init` to preselect answers and by `doctor` to explain what is on
-    8080/11434. Never raises: an unreachable port is simply not listed.
+    8080/11434/11435. Never raises: an unreachable port is simply not listed.
     """
     import httpx
 
     found = {}
-    for port, label in ((8080, "antigravity"), (11434, "ollama")):
+    for port, label in ((8080, "antigravity"), (11434, "ollama"), (11435, "local_jev")):
         try:
             response = httpx.get(
                 f"http://127.0.0.1:{port}/v1/models", timeout=timeout
@@ -685,6 +685,21 @@ def _check_classifier() -> tuple:
                 "fail",
                 f"ollama not reachable at {settings.classifier_api_url}",
                 "Start it: ollama serve   and pull the model: ollama pull " + settings.classifier_model,
+            )
+    if mode == "local_jev":
+        import httpx
+
+        try:
+            base = settings.classifier_api_url.rsplit("/chat/completions", 1)[0].rsplit("/completions", 1)[0]
+            response = httpx.get(f"{base}/models", timeout=3.0)
+            if response.status_code < 500:
+                return ("ok", f"local_jev reachable on Vulkan GPU ({settings.classifier_model})", "")
+            return ("warn", f"local_jev answered {response.status_code}", "Check llama-server status.")
+        except Exception:
+            return (
+                "fail",
+                f"local_jev not reachable at {settings.classifier_api_url}",
+                "Start llama-server on port 11435 with Vulkan GPU offload.",
             )
     # external_jev
     import httpx
@@ -1337,8 +1352,14 @@ def cmd_interactive(args: argparse.Namespace) -> int:
 
     # --- the box: what is running, where ------------------------------------
     services = detect_local_services()
-    if "antigravity" in services:
+    if "antigravity" in services and "local_jev" in services:
+        status = "Antigravity bridge (:8080) & Local Jev (:11435) detected"
+    elif "antigravity" in services:
         status = "Antigravity bridge detected on :8080"
+    elif "ollama" in services and "local_jev" in services:
+        status = "Ollama (:11434) & Local Jev (:11435) detected"
+    elif "local_jev" in services:
+        status = "Local Jev classifier detected on :11435"
     elif "ollama" in services:
         status = "Ollama detected on :11434"
     else:
@@ -1442,9 +1463,24 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     sys.stderr.write(ux.dim("  advanced:\n", stream=sys.stderr))
     for number, _key, label in WIZARD_ADVANCED_ENGINES:
         sys.stderr.write(f"    [{number}] {label}\n")
+    default_strategy_num = "2"
+    if existing.get("CLASSIFIER_MODE") == "local_jev":
+        default_strategy_num = "1"
+    elif existing.get("CLASSIFIER_MODE") == "upstream_reused":
+        default_strategy_num = "3"
+    elif existing.get("CLASSIFIER_MODE") == "local_ollama":
+        default_strategy_num = "4"
+    elif existing.get("CLASSIFIER_MODE") == "external_jev":
+        default_strategy_num = "5"
+    elif provider == "local" and "local_jev" in services:
+        default_strategy_num = "1"
+
     strategy = ""
     while strategy not in {key for _n, key, _l in WIZARD_STRATEGIES}:
-        raw = input_fn("Select 1-5 [2]: ").strip() or "2"
+        raw = (
+            input_fn(f"Select 1-5 [{default_strategy_num}]: ").strip()
+            or default_strategy_num
+        )
         strategy = next(
             (key for number, key, _l in WIZARD_STRATEGIES if raw == number), ""
         )

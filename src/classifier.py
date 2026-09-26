@@ -583,27 +583,35 @@ class Classifier:
         headers = {"Content-Type": "application/json"}
         if self.settings.classifier_api_key:
             headers["Authorization"] = f"Bearer {self.settings.classifier_api_key}"
-        effective_timeout = self.settings.classifier_timeout if timeout is None else timeout
+        budget = self.settings.classifier_timeout if timeout is None else timeout
+        # When CLASSIFIER_MODE=local_jev, prioritize getting the actual verdict
+        # rather than bailing out aggressively: give the socket generous tolerance
+        # (up to 3.5s) so latency spikes on long context or cold slots complete and
+        # return a real verdict instead of prematurely dropping into fail-open.
+        if self.mode == CLASSIFIER_MODE_LOCAL_JEV:
+            client_timeout = max(10.0, budget * 5)
+        else:
+            client_timeout = budget
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            async with httpx.AsyncClient(timeout=client_timeout) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     return None
                 data = response.json()
                 elapsed_ms = (time.perf_counter() - started) * 1000
-                budget_ms = effective_timeout * 1000
+                budget_ms = budget * 1000
                 # A slow verdict is still a verdict: log the spike and keep the
                 # answer rather than discarding it for being late.
-                if elapsed_ms > max(500.0, budget_ms / 2):
+                if elapsed_ms > budget_ms:
                     sys.stderr.write(
-                        f"[classifier] slow verdict: {elapsed_ms:.0f}ms "
+                        f"[classifier] latency spike: {elapsed_ms:.0f}ms "
                         f"(budget {budget_ms:.0f}ms) -- keeping the result\n"
                     )
                 return data
         except httpx.TimeoutException:
             sys.stderr.write(
-                f"[classifier] verdict timed out after {effective_timeout:.2f}s "
+                f"[classifier] verdict timed out after {client_timeout:.2f}s "
                 "-- failing open\n"
             )
             return None
@@ -646,6 +654,11 @@ class Classifier:
 
     def _build_jev_payload(self, state: str, question: str) -> Dict[str, Any]:
         """One-letter decision payload for the local Jev GGUF."""
+        # Bound state to avoid huge KV cache prefill overhead on long context prompts
+        clean_state = (state or "").strip()
+        if len(clean_state) > 2000:
+            clean_state = clean_state[:1200] + "\n...[truncated]...\n" + clean_state[-600:]
+
         payload: Dict[str, Any] = {
             "model": self.settings.classifier_model,
             "temperature": 0,
@@ -658,7 +671,7 @@ class Classifier:
                 {
                     "role": "user",
                     "content": JEV_DECISION_TEMPLATE.format(
-                        state=state, question=question
+                        state=clean_state, question=question
                     ),
                 }
             ],
