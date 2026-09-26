@@ -385,6 +385,10 @@ def _ensure_gateway_running() -> int:
             ["Run `agent-gateway doctor` to see who owns the port.",
              "Start on another port: agent-gateway start --port 8091"],
         )
+    # If a previously recorded gateway process is alive but not answering healthily
+    # on our configured port/data_dir, stop the stale/misconfigured process first.
+    if _pid_alive(_read_pid()):
+        cmd_stop(argparse.Namespace())
     namespace = argparse.Namespace(daemon=True, profile="", port=None)
     if cmd_start(namespace) != 0:
         raise CliError(
@@ -1507,6 +1511,11 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         + "\n"
     )
     sys.stderr.write(ux.dim("agent-gateway wrapper: " + hint, stream=sys.stderr) + "\n")
+
+    # When interactive setup writes a new configuration, stop any old
+    # gateway process running with previous settings so the new setup takes effect.
+    if _pid_alive(_read_pid()):
+        cmd_stop(argparse.Namespace())
 
     if agent == "standalone":
         if launching:

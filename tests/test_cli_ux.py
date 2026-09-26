@@ -731,3 +731,38 @@ def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
     assert cmd_interactive(args) == 0
     assert started.get("up") is True
     assert "CLASSIFIER_MODE=heuristics" in (tmp_path / ".env").read_text()
+
+
+def test_cmd_interactive_stops_running_gateway_on_reconfigure(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+    stopped = {}
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_read_pid", lambda: 9999)
+    monkeypatch.setattr(cli, "cmd_stop", lambda args: stopped.setdefault("stopped", True))
+    monkeypatch.setattr(cli, "_ensure_gateway_running", lambda: None)
+
+    args = cli.build_parser().parse_args(["interactive"])
+    answers = iter(["4", "2", "3", ""])
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    assert stopped.get("stopped") is True
+
+
+def test_ensure_gateway_running_stops_stale_pid_when_unhealthy(monkeypatch):
+    monkeypatch.setattr(cli, "_gateway_healthy", lambda: False)
+    monkeypatch.setattr(cli, "_probe_health", lambda timeout=1.0: None)
+    stopped = {}
+    started = {}
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_read_pid", lambda: 8888)
+    monkeypatch.setattr(cli, "cmd_stop", lambda args: stopped.setdefault("stopped", True))
+    monkeypatch.setattr(cli, "cmd_start", lambda args: started.setdefault("started", 0))
+
+    assert cli._ensure_gateway_running() == 0
+    assert stopped.get("stopped") is True
+    assert started.get("started") == 0
+
