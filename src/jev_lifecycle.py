@@ -196,7 +196,7 @@ def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
                 pass
     _clear_jev_pid(settings)
 
-    # 3. If any process is still listening on the Jev port, signal it
+    # 3. If any process is still listening on the Jev port, terminate it
     url = settings.local_jev_url
     parsed = urlparse(url)
     port = parsed.port or 11435
@@ -207,13 +207,20 @@ def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
             text=True,
             timeout=2.0,
         )
-        for part in res.stdout.strip().split():
-            if part.isdigit():
-                p = int(part)
-                try:
-                    os.kill(p, signal.SIGTERM)
-                except OSError:
-                    pass
+        pids = [int(p) for p in res.stdout.strip().split() if p.isdigit()]
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
+        if pids:
+            time.sleep(0.5)
+            for p in pids:
+                if _pid_alive(p):
+                    try:
+                        os.kill(p, signal.SIGKILL)
+                    except OSError:
+                        pass
     except Exception:
         pass
 

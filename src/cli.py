@@ -948,13 +948,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     sys.stderr.write(
         ux.dim("[run] env: " + ", ".join(sorted(build_agent_env(agent, settings.port))) + "\n", stream=sys.stderr)
     )
+    import atexit
+
+    def _cleanup():
+        cmd_stop(argparse.Namespace())
+
+    atexit.register(_cleanup)
     try:
         completed = subprocess.run(command, env=environment)
     except KeyboardInterrupt:
         return 130
     finally:
-        # Leave the gateway running so the next `run` is instant; `stop` is opt-in.
-        pass
+        _cleanup()
+        try:
+            atexit.unregister(_cleanup)
+        except Exception:
+            pass
     return completed.returncode
 
 
