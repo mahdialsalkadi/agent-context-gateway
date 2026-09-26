@@ -209,7 +209,7 @@ def _tool_description(tool: Any) -> str:
     else:
         desc = str(tool.get("description") or "")
     first_line = desc.strip().splitlines()[0] if desc.strip() else ""
-    return first_line[:160]
+    return first_line[:100]
 
 
 def parse_jev_tool_selection(text: str, candidate_names: Set[str]) -> List[str]:

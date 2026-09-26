@@ -143,7 +143,7 @@ def ensure_local_jev_running(settings: Settings, wait_seconds: float = 8.0) -> b
                     "-ngl",
                     "99",
                     "-c",
-                    "2048",
+                    "8192",
                     "--keep",
                     "-1",
                     "--threads",
