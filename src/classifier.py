@@ -308,7 +308,9 @@ async def route_tools_via_jev(
     user_content = f"Candidate Tools:\n{tools_summary}\n\n"
     if context:
         user_content += f"Conversation Context:\n{context}\n\n"
-    user_content += f"User Request: {prompt}\n\nSelected Tools (JSON array):"
+    # Keep prompt bounded for the tool router so massive pasted inputs do not blow budget
+    prompt_snippet = prompt[:2500] if len(prompt) > 2500 else prompt
+    user_content += f"User Request: {prompt_snippet}\n\nSelected Tools (JSON array):"
 
     payload = {
         "model": cfg.classifier_model,
