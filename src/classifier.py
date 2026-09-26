@@ -176,213 +176,195 @@ ALWAYS_KEEP_TOOLS = frozenset({"bash", "shell", "terminal", "fetch_log", "read_f
 # the configured ceiling.
 CORE_TOOLS = frozenset({"bash", "read_file", "edit_file", "write_file", "fetch_log"})
 
-_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
-# A prompt with no English lexical overlap -- Arabic, or anything the BM25
-# tokenizer cannot read -- used to score 0.0 on every tool, which hit the
-# historical "no evidence, so keep everything" fallback and leaked the whole
-# catalog back to the model. This table gives such prompts a cheap,
-# deterministic way to name the two or three tools they actually need.
-# Matching is a plain substring test on the lowered prompt, so Arabic morphology
-# ("وشغل" contains "شغل") still fires.
-INTENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
-    "bash": ("شغل", "نفذ", "اوامر", "تيرمينال", "كوماند", "run", "exec", "terminal", "test", "build"),
-    "read_file": ("اقرا", "اقرأ", "افحص", "شوف", "ملف", "كود", "read", "inspect", "view", "open", "show"),
-    "edit_file": ("عدل", "اكتب", "غير", "صلح", "write", "edit", "modify", "patch", "fix"),
-    "write_file": ("اكتب", "write", "create", "save"),
-    "web_search": ("ابحث", "دور", "انترنت", "جوجل", "search", "lookup", "google", "find"),
-}
+class RoutedToolList(list):
+    """A list of routed tool definitions with semantic routing metadata."""
 
-# One intent hit is worth more than any single BM25 term, because it is a direct
-# statement about which tool category the turn belongs to.
-INTENT_BOOST = 5.0
-
-# The blueprint's name for the same table, kept as an alias so both names in the
-# docs (`INTENT_KEYWORDS`, `ARABIC_INTENT_MAP`) resolve to one source of truth.
-ARABIC_INTENT_MAP = INTENT_KEYWORDS
+    def __init__(self, tools: Sequence[Dict[str, Any]] = ()):
+        super().__init__(tools)
+        self.selected_names: List[str] = [
+            _tool_name(t) for t in tools if isinstance(t, dict) and _tool_name(t)
+        ]
+        self.error: Optional[str] = None
+        self.raw_response: str = ""
 
 
-def intent_boosts(prompt: str) -> Dict[str, float]:
-    """Per-tool score boosts for intent the BM25 tokenizer cannot see.
-
-    Pure and allocation-light: a few dozen substring checks on the hot path.
-    """
-    text = (prompt or "").lower()
-    if not text:
-        return {}
-    return {
-        name: INTENT_BOOST
-        for name, keywords in INTENT_KEYWORDS.items()
-        if any(keyword in text for keyword in keywords)
-    }
-
-# Words too common to carry signal about which tool a turn needs. Without this,
-# "search the web for tutorials" ranks `screenshot` because its description
-# contains "the".
-STOPWORDS = frozenset(
-    "a an and are as at be by for from has have in into is it its of on or that "
-    "the their them then there these they this to was were will with without you your"
-    .split()
-)
-
-# Sublinear IDF weights rare terms up; a term in every document is worthless for
-# ranking. The +1 inside the log keeps the weight positive and defined for a term
-# that somehow appears in every tool.
-def _bm25_scores(query_tokens: Sequence[str], documents: Sequence[Sequence[str]]) -> List[float]:
-    """BM25 ranking of `documents` against `query_tokens`, k1=1.2, b=0.75.
-
-    Implemented inline rather than pulled in as a dependency: the whole ranker
-    must stay well under 2ms for a 30-tool payload, and BM25 over a few dozen
-    short documents is a handful of array passes.
-    """
-    total_docs = len(documents)
-    if total_docs == 0 or not query_tokens:
-        return [0.0] * total_docs
-
-    doc_tokens = [list(document) for document in documents]
-    doc_counts = [len(tokens) or 1 for tokens in doc_tokens]
-    average_length = sum(doc_counts) / total_docs
-
-    document_frequency: Dict[str, int] = {}
-    for tokens in doc_tokens:
-        for term in set(tokens):
-            document_frequency[term] = document_frequency.get(term, 0) + 1
-
-    scores: List[float] = []
-    for tokens, count in zip(doc_tokens, doc_counts):
-        score = 0.0
-        for term in query_tokens:
-            frequency = tokens.count(term)
-            if not frequency:
-                continue
-            df = document_frequency.get(term, 0)
-            idf = math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
-            tf_component = (frequency * 2.2) / (
-                frequency + 1.2 * (1.0 - 0.75 + 0.75 * count / average_length)
-            )
-            score += idf * tf_component
-        scores.append(score)
-    return scores
-
-
-def _tool_text(tool: Dict[str, Any]) -> Tuple[str, str]:
-    """(name, searchable text) for either the OpenAI or Anthropic tool shape."""
+def _tool_name(tool: Any) -> str:
+    """Extract tool name in either OpenAI or Anthropic payload shape."""
     if not isinstance(tool, dict):
-        return "", ""
+        return ""
     function = tool.get("function")
-    if isinstance(function, dict):
-        name = str(function.get("name") or "")
-        description = str(function.get("description") or "")
-        return name, f"{name} {description}"
-    # Anthropic shape: the fields sit directly on the tool object.
-    name = str(tool.get("name") or "")
-    description = str(tool.get("description") or "")
-    return name, f"{name} {description}"
+    if isinstance(function, dict) and "name" in function:
+        return str(function.get("name") or "")
+    return str(tool.get("name") or "")
 
 
-def _hard_cap(
-    tools: List[Dict[str, Any]],
-    scores: List[float],
-    boosts: Dict[str, float],
-    keep_limit: int,
-) -> List[Dict[str, Any]]:
-    """An absolute ceiling on a large schema: never the catalog, never > limit.
-
-    Core I/O tools are served first; relevance fills whatever is left. When the
-    prompt produced no evidence at all -- every BM25 score 0.0 and no intent
-    match -- only the core tools survive, instead of the historical
-    "keep everything" fallback that leaked 40+ schemas to the model.
-    """
-    core_indices = [
-        index
-        for index, tool in enumerate(tools)
-        if _tool_text(tool)[0].lower() in CORE_TOOLS
-    ]
-    combined = [
-        score + boosts.get(_tool_text(tool)[0].lower(), 0.0)
-        for tool, score in zip(tools, scores)
-    ]
-    positive = [index for index, value in enumerate(combined) if value > 0.0]
-    if not positive:
-        return [tools[index] for index in core_indices[:keep_limit]]
-
-    selected = sorted(positive, key=lambda index: combined[index], reverse=True)[
-        :keep_limit
-    ]
-    # Guarantee the core set inside the ceiling: displace the weakest non-core
-    # pick rather than overflowing the limit.
-    core_selected = set(core_indices)
-    for index in core_indices:
-        if index in selected:
-            continue
-        if len(selected) < keep_limit:
-            selected.append(index)
-            continue
-        for candidate in reversed(selected):
-            if candidate not in core_selected:
-                selected[selected.index(candidate)] = index
-                break
-
-    keep = set(selected)
-    return [tool for index, tool in enumerate(tools) if index in keep]
+def _tool_description(tool: Any) -> str:
+    """Extract a 1-line description in either OpenAI or Anthropic shape."""
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict) and "description" in function:
+        desc = str(function.get("description") or "")
+    else:
+        desc = str(tool.get("description") or "")
+    first_line = desc.strip().splitlines()[0] if desc.strip() else ""
+    return first_line[:160]
 
 
-def rank_tools(
+def parse_jev_tool_selection(text: str, candidate_names: Set[str]) -> List[str]:
+    """Parse Jev output into a list of valid candidate tool names."""
+    if not text:
+        return []
+    cleaned = text.strip()
+
+    # 1. Try finding a JSON array in the text
+    match = re.search(r"\[.*?\]", cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list):
+                result = []
+                for item in parsed:
+                    name = str(item).strip().strip("'\"`")
+                    if name in candidate_names and name not in result:
+                        result.append(name)
+                return result
+        except Exception:
+            pass
+
+    # 2. Try JSON object with "tools" or "selected_tools"
+    match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                tools_list = parsed.get("tools") or parsed.get("selected_tools") or []
+                if isinstance(tools_list, list):
+                    result = []
+                    for item in tools_list:
+                        name = str(item).strip().strip("'\"`")
+                        if name in candidate_names and name not in result:
+                            result.append(name)
+                    return result
+        except Exception:
+            pass
+
+    # 3. Comma-separated or tokenized output fallback
+    tokens = re.findall(r"[a-zA-Z0-9_\-]+", cleaned)
+    result = []
+    for token in tokens:
+        if token in candidate_names and token not in result:
+            result.append(token)
+    return result
+
+
+async def route_tools_via_jev(
     prompt: str,
     tools: List[Dict[str, Any]],
-    keep_limit: int = DEFAULT_SELECTIVE_TOOL_LIMIT,
-    hard_cap: bool = False,
+    client: Optional[httpx.AsyncClient] = None,
+    settings: Optional[Settings] = None,
+    context: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """The tools worth sending, ranked by relevance to the prompt.
+    """Semantically route candidate tools via Jev without BM25 or arbitrary caps.
 
-    Mission-critical I/O tools are always preserved; everything else competes on
-    a BM25 score of the prompt against each tool's name and description. Pure
-    and local: no model call, well under 2ms for realistic payload sizes.
-
-    `hard_cap` switches from the conservative default (when there is no evidence
-    the whole schema is returned) to the gateway's absolute ceiling: a large
-    schema is never returned whole, multilingual intent is boosted, and the
-    result is always `<= keep_limit`. The gateway path passes `hard_cap=True`.
+    Constructs a structured routing prompt for Jev with candidate tool descriptions
+    and user request / execution context. Jev outputs strictly the needed tool names.
+    Returns the exact tool subset in original payload order.
     """
+    if not tools:
+        return RoutedToolList([])
+
+    from .config import load_settings
+
+    cfg = settings or load_settings()
+
+    candidate_map: Dict[str, Dict[str, Any]] = {}
+    tool_lines: List[str] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name = _tool_name(t)
+        if not name:
+            continue
+        candidate_map[name] = t
+        desc = _tool_description(t)
+        tool_lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+
+    if not candidate_map:
+        return RoutedToolList(tools)
+
+    tools_summary = "\n".join(tool_lines)
+
+    system_prompt = (
+        "You are a semantic tool router. Given candidate tools and user request/context, "
+        "select ONLY the tool names strictly required to fulfill this turn.\n"
+        "Rules:\n"
+        "1. Return ONLY a valid JSON array of tool name strings, e.g. [\"tool1\", \"tool2\"].\n"
+        "2. If no tools are needed (e.g. conversational questions, explanations, creative writing), output [].\n"
+        "3. Do not include markdown codeblocks, thoughts, or explanations. Only the raw JSON array."
+    )
+
+    user_content = f"Candidate Tools:\n{tools_summary}\n\n"
+    if context:
+        user_content += f"Conversation Context:\n{context}\n\n"
+    user_content += f"User Request: {prompt}\n\nSelected Tools (JSON array):"
+
+    payload = {
+        "model": cfg.classifier_model,
+        "temperature": 0.0,
+        "max_tokens": 128,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if cfg.classifier_api_key:
+        headers["Authorization"] = f"Bearer {cfg.classifier_api_key}"
+
+    target_url = cfg.classifier_api_url
+    if not target_url and getattr(cfg, "local_jev_url", None):
+        target_url = cfg.local_jev_url
+    if not target_url or not target_url.startswith(("http://", "https://")):
+        target_url = DEFAULT_LOCAL_JEV_URL
+
+    budget = float(getattr(cfg, "local_jev_timeout", None) or LOCAL_JEV_TIMEOUT_SECONDS)
+    timeout = max(5.0, budget * 3)
+
     try:
-        keep_limit = max(1, int(keep_limit))
-        query_tokens = [
-            token
-            for token in _TOKEN_RE.findall((prompt or "").lower())
-            if token not in STOPWORDS
-        ]
-        if not query_tokens:
-            if hard_cap:
-                return _hard_cap(tools, [0.0] * len(tools), intent_boosts(prompt), keep_limit)
-            return list(tools)
+        if client is not None:
+            res = await client.post(target_url, json=payload, headers=headers, timeout=timeout)
+        else:
+            async with httpx.AsyncClient(timeout=timeout) as cl:
+                res = await cl.post(target_url, json=payload, headers=headers)
 
-        documents = [_TOKEN_RE.findall(_tool_text(tool)[1].lower()) for tool in tools]
-        scores = _bm25_scores(query_tokens, documents)
+        if res.status_code != 200:
+            err_msg = f"HTTP {res.status_code}: {res.text[:200]}"
+            sys.stderr.write(f"[JEV-ROUTER-ERROR] semantic tool routing failed: {err_msg}\n")
+            out = RoutedToolList(tools)
+            out.error = err_msg
+            return out
 
-        if hard_cap:
-            return _hard_cap(tools, scores, intent_boosts(prompt), keep_limit)
+        data = res.json()
+        raw_text = reply_text(data)
+        chosen_names = parse_jev_tool_selection(raw_text, set(candidate_map.keys()))
 
-        # Only shrink the schema when there is actual evidence. A prompt that
-        # matches no tool at all says nothing about which tools matter, so the
-        # safe move is to keep everything rather than gamble on an arbitrary cut.
-        positive = [index for index, score in enumerate(scores) if score > 0.0]
-        if not positive:
-            return list(tools)
+        selected_set = set(chosen_names)
+        filtered = [t for t in tools if _tool_name(t) in selected_set]
+        out = RoutedToolList(filtered)
+        out.selected_names = chosen_names
+        out.raw_response = raw_text
+        return out
 
-        ranked = sorted(positive, key=lambda i: scores[i], reverse=True)
-        kept_indices = set(ranked[:keep_limit])
-
-        # Always-keep tools come along even when they did not match the prompt.
-        for index, tool in enumerate(tools):
-            if _tool_text(tool)[0].lower() in ALWAYS_KEEP_TOOLS:
-                kept_indices.add(index)
-
-        # Preserve payload order: schemas are compared across turns by some
-        # providers for prompt-cache reuse, and reordering them defeats it.
-        return [tool for index, tool in enumerate(tools) if index in kept_indices]
-    except Exception:
-        # Ranking is an optimisation. Any surprise means keep everything.
-        return list(tools)
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        sys.stderr.write(f"[JEV-ROUTER-ERROR] semantic tool routing failed: {err_msg}\n")
+        out = RoutedToolList(tools)
+        out.error = err_msg
+        return out
 
 
 def inject_escape_instruction(messages: List[Dict[str, Any]]) -> bool:
@@ -815,6 +797,18 @@ class Classifier:
             self.settings.classifier_supersede_threshold,
         )
 
+    async def route_tools(
+        self,
+        prompt: str,
+        tools: List[Dict[str, Any]],
+        client: Optional[httpx.AsyncClient] = None,
+        context: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantically route candidate tools via Jev."""
+        return await route_tools_via_jev(
+            prompt, tools, client=client, settings=self.settings, context=context
+        )
+
 
 # ------------------------------------------------------------------------------
 # Routing policy
@@ -906,12 +900,14 @@ def get_classifier(settings: Optional[Settings] = None) -> Classifier:
 
 __all__ = [
     "ALWAYS_KEEP_TOOLS",
-    "ARABIC_INTENT_MAP",
     "CORE_TOOLS",
-    "INTENT_BOOST",
-    "INTENT_KEYWORDS",
     "Decision",
     "Classifier",
+    "RoutedToolList",
+    "route_tools_via_jev",
+    "parse_jev_tool_selection",
+    "_tool_name",
+    "_tool_description",
     "CLASSIFIER_MODE_EXTERNAL_JEV",
     "CLASSIFIER_MODE_HEURISTICS",
     "CLASSIFIER_MODE_LOCAL_JEV",
@@ -921,8 +917,6 @@ __all__ = [
     "JEV_NEEDS_TOOLS_QUESTION",
     "JEV_SUPERSEDE_QUESTION",
     "LOCAL_JEV_TIMEOUT_SECONDS",
-    "rank_tools",
-    "intent_boosts",
     "ESCAPE_INSTRUCTION",
     "ESCAPE_TOKEN",
     "decide_route",

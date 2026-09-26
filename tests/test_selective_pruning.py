@@ -1,34 +1,40 @@
 """
-Selective sub-tool pruning.
+Semantic Tool Routing via Jev (Local Qwen3.5-2B on Vulkan).
 
-The point of this file: when an agent offers 20+ tools, most turns need two or
-three of them, and sending the whole schema is pure waste. These tests pin the
-ranker's precision (irrelevant tools are gone), its recall guarantees
-(mission-critical I/O survives; Anthropic shapes work), and its honesty (when
-there is no evidence, nothing is dropped).
+Validates the Semantic Tool Router architecture:
+- BM25 lexical ranking and arbitrary hard caps (<= 5) are eliminated.
+- Jev determines the exact tool subset required for each turn.
+- Single tool, multi-tool (e.g. 7 tools without caps), and conversational (0 tools) selections.
+- Multi-turn execution-aware context routing.
+- Diagnostic fail-open with explicit error logging when Jev is unavailable.
+- Gateway integration and audit telemetry across OpenAI and Anthropic surfaces.
 """
 
 from __future__ import annotations
 
-import time
-
-from src.classifier import (
-    ALWAYS_KEEP_TOOLS,
-    ARABIC_INTENT_MAP,
-    CORE_TOOLS,
-    INTENT_KEYWORDS,
-    intent_boosts,
-    rank_tools,
-)
-from src.config import (
-    DEFAULT_SELECTIVE_TOOL_LIMIT,
-    SELECTIVE_PRUNING_MIN_TOOLS,
-    load_settings,
-)
-from src.gateway import apply_selective_pruning, create_app, prune_for_tool_loop
+import json
+from dataclasses import replace
+from typing import Any, Dict, List
 
 import httpx
 import pytest
+
+from src.analytics import PRUNED_ROUTES, Analytics
+from src.classifier import (
+    RoutedToolList,
+    _tool_description,
+    _tool_name,
+    parse_jev_tool_selection,
+    route_tools_via_jev,
+)
+from src.config import Settings, load_settings
+from src.dashboard import recent_requests
+from src.gateway import (
+    apply_selective_pruning,
+    create_app,
+    extract_execution_context,
+    prune_for_tool_loop,
+)
 
 
 def tool(name: str, description: str, properties: int = 2) -> dict:
@@ -51,22 +57,6 @@ def anthropic_tool(name: str, description: str) -> dict:
         "description": description,
         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
     }
-
-
-def names(tools):
-    """Tool names in either payload shape."""
-    result = []
-    for t in tools:
-        if not isinstance(t, dict):
-            continue
-        if isinstance(t.get("function"), dict):
-            result.append(t["function"]["name"])
-        else:
-            result.append(t.get("name"))
-    return result
-
-
-ARABIC_PROMPT = "افحص ملف الكود وشغل التيست"  # "inspect the code file and run the test"
 
 
 def build_toolset(count: int = 22) -> list:
@@ -96,479 +86,391 @@ def build_toolset(count: int = 22) -> list:
     ][:count]
 
 
-def big_toolset(count: int = 25) -> list:
-    """A realistic wide catalog: the base set, padded above `count`."""
-    tools = build_toolset()
-    while len(tools) < count:
-        tools.append(
-            tool(f"aux_{len(tools)}", f"auxiliary capability number {len(tools)}")
+# ------------------------------------------------------------------------------
+# Phase 1: Jev output parsing
+# ------------------------------------------------------------------------------
+def test_parse_jev_tool_selection_json_array():
+    candidates = {"bash", "read_file", "web_search", "write_file"}
+    assert parse_jev_tool_selection('["bash", "read_file"]', candidates) == ["bash", "read_file"]
+
+
+def test_parse_jev_tool_selection_markdown_fences():
+    candidates = {"bash", "read_file", "web_search"}
+    raw = '```json\n["web_search"]\n```'
+    assert parse_jev_tool_selection(raw, candidates) == ["web_search"]
+
+
+def test_parse_jev_tool_selection_json_object():
+    candidates = {"bash", "read_file", "web_search"}
+    raw = '{"tools": ["bash", "web_search"]}'
+    assert parse_jev_tool_selection(raw, candidates) == ["bash", "web_search"]
+
+
+def test_parse_jev_tool_selection_comma_separated():
+    candidates = {"bash", "read_file", "web_search"}
+    raw = "bash, web_search"
+    assert parse_jev_tool_selection(raw, candidates) == ["bash", "web_search"]
+
+
+def test_parse_jev_tool_selection_empty_array_or_none():
+    candidates = {"bash", "read_file"}
+    assert parse_jev_tool_selection("[]", candidates) == []
+    assert parse_jev_tool_selection("none", candidates) == []
+    assert parse_jev_tool_selection("", candidates) == []
+
+
+def test_parse_jev_tool_selection_discards_hallucinated_tools():
+    candidates = {"bash", "read_file"}
+    raw = '["bash", "imaginary_tool_42"]'
+    assert parse_jev_tool_selection(raw, candidates) == ["bash"]
+
+
+# ------------------------------------------------------------------------------
+# Phase 1: Semantic tool router (route_tools_via_jev)
+# ------------------------------------------------------------------------------
+async def test_route_tools_via_jev_selects_exact_subset():
+    tools = build_toolset(10)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(["bash", "read_file"])}}
+                ]
+            },
         )
-    return tools
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mock-jev") as client:
+        routed = await route_tools_via_jev(
+            prompt="check the code and run tests",
+            tools=tools,
+            client=client,
+        )
+
+    assert isinstance(routed, RoutedToolList)
+    assert getattr(routed, "selected_names") == ["bash", "read_file"]
+    assert len(routed) == 2
+    assert [_tool_name(t) for t in routed] == ["bash", "read_file"]
+    # Full schemas preserved
+    assert routed[0] == tools[0]
+    assert routed[1] == tools[1]
 
 
-# ------------------------------------------------------------------------------
-# Ranker precision
-# ------------------------------------------------------------------------------
-def test_web_prompt_keeps_the_search_tool_and_drops_the_rest():
-    tools = build_toolset()
-    kept = rank_tools("search the web for rust async tutorials", tools, 5)
-
-    assert "web_search" in names(kept)
-    assert len(kept) < len(tools)
-    # Irrelevant tools must be gone, not merely ranked lower.
-    assert "spotify_play" not in names(kept)
-    assert "smart_home" not in names(kept)
-    assert "stock_price" not in names(kept)
-
-
-def test_shell_prompt_keeps_bash_and_read_helpers():
-    tools = build_toolset()
-    kept = names(rank_tools("run the test suite in bash", tools, 5))
-
-    assert "bash" in kept
-
-
-def test_email_prompt_ranks_send_email_first():
-    tools = build_toolset()
-    kept = names(rank_tools("send an email to alice about the meeting", tools, 5))
-
-    assert "send_email" in kept
-
-
-def test_stopwords_do_not_rank_irrelevant_tools():
-    """'search the web for tutorials' contains 'the'; screenshot must not ride in."""
-    tools = build_toolset()
-    kept = names(rank_tools("search the web for tutorials", tools, 5))
-
-    assert "screenshot" not in kept
-
-
-def test_kept_tools_never_exceed_the_limit():
-    tools = build_toolset(25)
-    kept = rank_tools("search the web and read files and run git commits", tools, 5)
-    assert len(kept) <= 5 + len(ALWAYS_KEEP_TOOLS)
-
-
-def test_payload_order_is_preserved():
-    """Some providers reuse prompt caches keyed on schema order."""
-    tools = build_toolset()
-    kept = rank_tools("send an email about the weather", tools, 5)
-    original_positions = [tools.index(t) for t in kept]
-    assert original_positions == sorted(original_positions)
-
-
-# ------------------------------------------------------------------------------
-# Recall guarantees
-# ------------------------------------------------------------------------------
-def test_mission_critical_tools_survive_even_when_unmentioned():
-    tools = build_toolset()
-    kept = names(rank_tools("generate an image of a sunset", tools, 3))
-
-    assert "bash" in kept, "the escape-replay contract promises a shell"
-    assert "fetch_log" in kept, "the gateway's own retrieval tool"
-    assert "read_file" in kept, "how an agent recovers context after a strip"
-
-
-def test_anthropic_tool_shape_is_supported():
-    tools = [
-        anthropic_tool("web_search", "Search the web for information"),
-        anthropic_tool("send_email", "Send an email to a recipient"),
-        anthropic_tool("weather", "Get the weather forecast"),
-        anthropic_tool("stock_price", "Get a stock price quote"),
+async def test_route_tools_via_jev_no_arbitrary_cap_allows_7_tools():
+    """Validates Invariant 2: No arbitrary <= 5 cap."""
+    tools = build_toolset(20)
+    seven_tools = [
+        "bash", "read_file", "write_file", "git_commit",
+        "web_search", "web_fetch", "docker_build"
     ]
-    kept = names(rank_tools("search the web for tutorials", tools, 2))
 
-    assert "web_search" in kept
-    assert "stock_price" not in kept
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(seven_tools)}}]},
+        )
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mock-jev") as client:
+        routed = await route_tools_via_jev(
+            prompt="full dev pipeline task",
+            tools=tools,
+            client=client,
+        )
+
+    assert len(routed) == 7
+    assert getattr(routed, "selected_names") == seven_tools
+
+
+async def test_route_tools_via_jev_empty_for_conversational():
+    tools = build_toolset(10)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "[]"}}]},
+        )
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mock-jev") as client:
+        routed = await route_tools_via_jev(
+            prompt="write a haiku about trees",
+            tools=tools,
+            client=client,
+        )
+
+    assert len(routed) == 0
+    assert getattr(routed, "selected_names") == []
+
+
+async def test_route_tools_via_jev_passes_execution_context():
+    """Validates Invariant 3: Execution-aware context routing."""
+    tools = build_toolset(10)
+    seen_prompts = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        user_msg = body["messages"][1]["content"]
+        seen_prompts.append(user_msg)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '["write_file"]'}}]},
+        )
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mock-jev") as client:
+        context = "Tool Result (call_1): Found relevant weather API keys in config"
+        routed = await route_tools_via_jev(
+            prompt="save this to disk",
+            tools=tools,
+            client=client,
+            context=context,
+        )
+
+    assert len(seen_prompts) == 1
+    assert "Found relevant weather API keys" in seen_prompts[0]
+    assert [_tool_name(t) for t in routed] == ["write_file"]
+
+
+async def test_route_tools_via_jev_fails_open_on_error(capsys):
+    """Validates Diagnostic Fail-Open requirement: logs [JEV-ROUTER-ERROR]."""
+    tools = build_toolset(5)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Internal Server Error")
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mock-jev") as client:
+        routed = await route_tools_via_jev(
+            prompt="do something",
+            tools=tools,
+            client=client,
+        )
+
+    # Returns full catalog unmodified
+    assert len(routed) == len(tools)
+    assert getattr(routed, "error") is not None
+    assert "HTTP 500" in getattr(routed, "error")
+
+    captured = capsys.readouterr()
+    assert "[JEV-ROUTER-ERROR]" in captured.err
 
 
 # ------------------------------------------------------------------------------
-# Honesty: no evidence, no pruning
+# Backwards compatibility shims
 # ------------------------------------------------------------------------------
-def test_prompt_matching_nothing_keeps_everything():
-    tools = build_toolset()
-    kept = rank_tools("tell me a joke about penguins", tools, 5)
-    assert len(kept) == len(tools)
-
-
-def test_stopword_only_prompt_keeps_everything():
-    tools = build_toolset()
-    kept = rank_tools("to be or not to be", tools, 5)
-    assert len(kept) == len(tools)
-
-
-def test_empty_prompt_keeps_everything():
-    tools = build_toolset()
-    assert len(rank_tools("", tools, 5)) == len(tools)
-
-
-def test_garbage_tools_do_not_crash_the_ranker():
-    tools = [None, "not-a-dict", {"function": "broken"}, *build_toolset(10)]
-    kept = rank_tools("search the web for tutorials", tools, 5)
-    assert isinstance(kept, list)
-
-
-# ------------------------------------------------------------------------------
-# Latency budget: the ranker rides on the hot path
-# ------------------------------------------------------------------------------
-def test_ranking_a_30_tool_payload_is_sub_2ms():
-    tools = build_toolset(25) + [
-        tool(f"extra_{i}", f"description number {i} for tool {i}") for i in range(5)
-    ]
-    prompt = "refactor the auth module and run the whole test suite with bash"
-
-    started = time.perf_counter()
-    for _ in range(200):
-        rank_tools(prompt, tools, 5)
-    per_call_ms = (time.perf_counter() - started) / 200 * 1000
-
-    assert per_call_ms < 2.0, f"ranker took {per_call_ms:.3f}ms per call on 30 tools"
-
-
-def test_bm25_scores_a_large_catalog_quickly():
-    tools = build_toolset(22)
-    prompt = "summarise the deployment status and fetch the build logs"
-    started = time.perf_counter()
-    for _ in range(200):
-        rank_tools(prompt, tools, 5)
-    per_call_ms = (time.perf_counter() - started) / 200 * 1000
-    assert per_call_ms < 2.0
-
-
-# ------------------------------------------------------------------------------
-# Route integration
-# ------------------------------------------------------------------------------
-def test_apply_selective_pruning_gates_on_threshold_and_toggle():
+def test_deprecated_shims():
+    tools = build_toolset(5)
     settings = load_settings(env={})
-    tools = build_toolset(22)
-    prompt = "search the web for tutorials"
+    pruned, dropped = apply_selective_pruning(settings, "test", tools)
+    assert pruned == tools
+    assert dropped == 0
 
-    # Disabled: untouched.
-    disabled = type(settings)(**{**settings.__dict__, "enable_selective_pruning": False})
-    assert apply_selective_pruning(disabled, prompt, tools)[1] == 0
-
-    # Below the threshold: untouched.
-    small = tools[: SELECTIVE_PRUNING_MIN_TOOLS]
-    assert apply_selective_pruning(settings, prompt, small)[1] == 0
-
-    # Above it: pruned.
-    kept, dropped = apply_selective_pruning(settings, prompt, tools)
-    assert dropped > 0
-    assert len(kept) < len(tools)
+    loop_pruned, loop_dropped = prune_for_tool_loop(tools, ["bash"])
+    assert loop_pruned == tools
+    assert loop_dropped == 0
 
 
-async def test_gateway_route_prunes_a_20_tool_schema(settings, store, memory, mock_state):
-    """End to end: 20 tools in, few tools out, telemetry headers set."""
-    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
+# ------------------------------------------------------------------------------
+# Phase 2: Gateway Integration (OpenAI Surface)
+# ------------------------------------------------------------------------------
+async def test_gateway_jev_routed_three_tools(settings, store, memory, mock_state):
+    """Gateway in local_jev mode forwards Jev's exact selection."""
+    from unittest.mock import AsyncMock, patch
+
+    tuned = replace(settings, classifier_mode="local_jev")
     app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
 
     payload_tools = build_toolset(20)
+    selected = [payload_tools[0], payload_tools[1], payload_tools[2]]
+    routed_result = RoutedToolList(selected)
+    routed_result.selected_names = ["bash", "read_file", "write_file"]
+
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://gw", timeout=30.0
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "mock-model",
-                "stream": True,
-                "messages": [{"role": "user", "content": "search the web for tutorials"}],
-                "tools": payload_tools,
-            },
-        )
+    with patch("src.gateway.route_tools_via_jev", new=AsyncMock(return_value=routed_result)):
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw", timeout=30.0) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "refactor the code and run tests"}],
+                    "tools": payload_tools,
+                },
+            )
 
     assert response.status_code == 200
-    before = int(response.headers["x-proxy-tools-before"])
+    assert response.headers["x-proxy-route"] == "Jev-Routed (3 tools)"
+    assert response.headers["x-proxy-tool-action"] == "Retained-Semantic"
     after = int(response.headers["x-proxy-tools-after"])
-    assert before == 21, "the synthetic fetch_log tool is appended before counting"
-    assert after < before, "the schema must shrink"
-
-    # And the upstream actually received the smaller schema.
-    assert len(mock_state.bodies[-1]["tools"]) == after
+    assert after == 3
+    sent = [_tool_name(t) for t in mock_state.bodies[-1]["tools"]]
+    assert sent == ["bash", "read_file", "write_file"]
 
 
-async def test_forced_tool_choice_is_never_pruned(settings, store, memory):
-    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
+async def test_gateway_jev_routed_seven_tools_no_arbitrary_cap(
+    settings, store, memory, mock_state
+):
+    """Gateway forwards all 7 tools without any 5-tool truncation."""
+    from unittest.mock import AsyncMock, patch
+
+    seven_names = [
+        "bash", "read_file", "write_file", "git_commit",
+        "web_search", "web_fetch", "docker_build"
+    ]
+    tuned = replace(settings, classifier_mode="local_jev")
     app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
 
     payload_tools = build_toolset(20)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://gw", timeout=30.0
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "mock-model",
-                "stream": True,
-                "tool_choice": {"type": "function", "function": {"name": "web_search"}},
-                "messages": [{"role": "user", "content": "search the web for tutorials"}],
-                "tools": payload_tools,
-            },
-        )
-
-    after = int(response.headers["x-proxy-tools-after"])
-    assert after == 21, "an explicit tool_choice means every tool may be needed"
-
-
-async def test_stripped_route_does_not_rank(settings, store, memory):
-    """All-or-nothing and selective pruning must not both fire on one turn."""
-    from src.classifier import Classifier
-    from dataclasses import replace as dc_replace
-
-    tuned = dc_replace(
-        type(settings)(
-            **{
-                **settings.__dict__,
-                "classifier_api_url": "https://c.test/v1/chat/completions",
-                "classifier_api_key": "k",
-            }
-        ),
-    )
-    stripper = Classifier(tuned)
-
-    async def always_false(_prompt):
-        return False
-
-    stripper.needs_tools = always_false
-    app = create_app(settings=tuned, classifier=stripper, store=store, memory=memory)
+    selected = [t for t in payload_tools if _tool_name(t) in seven_names]
+    routed_result = RoutedToolList(selected)
+    routed_result.selected_names = seven_names
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://gw", timeout=30.0
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "mock-model",
-                "stream": True,
-                "messages": [{"role": "user", "content": "search the web for tutorials"}],
-                "tools": build_toolset(20),
-            },
-        )
+    with patch("src.gateway.route_tools_via_jev", new=AsyncMock(return_value=routed_result)):
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw", timeout=30.0) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "complete task"}],
+                    "tools": payload_tools,
+                },
+            )
 
+    assert response.status_code == 200
+    assert response.headers["x-proxy-route"] == "Jev-Routed (7 tools)"
+    sent = [_tool_name(t) for t in mock_state.bodies[-1]["tools"]]
+    assert len(sent) == 7
+    assert set(sent) == set(seven_names)
+
+
+async def test_gateway_jev_strips_conversational_turn(settings, store, memory, mock_state):
+    """Jev returning [] results in Jev-Strip and 0 tools."""
+    from unittest.mock import AsyncMock, patch
+
+    tuned = replace(settings, classifier_mode="local_jev")
+    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
+
+    routed_result = RoutedToolList([])
+    routed_result.selected_names = []
+
+    transport = httpx.ASGITransport(app=app)
+    with patch("src.gateway.route_tools_via_jev", new=AsyncMock(return_value=routed_result)):
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw", timeout=30.0) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "write an essay on stars"}],
+                    "tools": build_toolset(10),
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.headers["x-proxy-route"] == "Jev-Strip"
     assert response.headers["x-proxy-tool-action"] == "Stripped-ZeroTokens"
-    after = int(response.headers["x-proxy-tools-after"])
-    assert after == 0, "a stripped turn sends no schema at all"
+    assert "tools" not in mock_state.bodies[-1]
+
+
+async def test_gateway_jev_fail_open_on_jev_crash(settings, store, memory, mock_state):
+    """When Jev is down, gateway fails open with Jev-Router-FailOpen."""
+    from unittest.mock import AsyncMock, patch
+
+    tuned = replace(settings, classifier_mode="local_jev")
+    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
+
+    payload_tools = build_toolset(10)
+    fail_open_result = RoutedToolList(payload_tools)
+    fail_open_result.error = "Connection Refused"
+
+    transport = httpx.ASGITransport(app=app)
+    with patch("src.gateway.route_tools_via_jev", new=AsyncMock(return_value=fail_open_result)):
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw", timeout=30.0) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "run task"}],
+                    "tools": payload_tools,
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.headers["x-proxy-route"] == "Jev-Router-FailOpen"
+    assert response.headers["x-proxy-tool-action"] == "Retained-Classifier"
+    assert len(mock_state.bodies[-1]["tools"]) >= 10
 
 
 # ------------------------------------------------------------------------------
-# Hard cap: the gateway never forwards the whole catalog
+# Phase 2: Gateway Integration (Anthropic Surface)
 # ------------------------------------------------------------------------------
-def test_core_tools_fit_inside_the_default_limit():
-    assert len(CORE_TOOLS) <= DEFAULT_SELECTIVE_TOOL_LIMIT
+async def test_anthropic_surface_jev_routing(settings, store, memory, mock_state):
+    from unittest.mock import AsyncMock, patch
 
-
-def test_intent_map_boosts_core_tools_for_an_arabic_prompt():
-    boosts = intent_boosts(ARABIC_PROMPT)
-    assert boosts.get("bash")
-    assert boosts.get("read_file")
-
-
-def test_hard_cap_falls_back_to_only_core_tools_when_there_is_no_evidence():
-    tools = big_toolset(25)
-    kept = rank_tools("tell me a joke about penguins", tools, 5, hard_cap=True)
-
-    assert 0 < len(kept) <= 5
-    assert set(names(kept)).issubset(CORE_TOOLS)
-    # The legacy default is untouched -- the gateway opts in explicitly.
-    assert len(rank_tools("tell me a joke about penguins", tools, 5)) == len(tools)
-
-
-def test_hard_cap_keeps_bash_and_read_file_for_arabic_within_the_limit():
-    kept = names(rank_tools(ARABIC_PROMPT, big_toolset(25), 5, hard_cap=True))
-
-    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
-    assert "bash" in kept
-    assert "read_file" in kept
-
-
-def test_arabic_intent_map_alias_shares_one_source_of_truth():
-    assert ARABIC_INTENT_MAP is INTENT_KEYWORDS
-    assert "شغل" in ARABIC_INTENT_MAP["bash"]
-    assert "افحص" in ARABIC_INTENT_MAP["read_file"]
-
-
-def test_mission_arabic_prompt_caps_a_49_tool_catalog():
-    """The blueprint's headline case: 49 tools in, core trio out."""
-    kept = names(rank_tools("افحص الملف وشغل التيست", big_toolset(49), 5, hard_cap=True))
-
-    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
-    assert {"bash", "read_file", "fetch_log"}.issubset(set(kept))
-
-
-def test_hard_cap_shrinks_a_prompt_with_no_english_overlap():
-    """Non-English intent must not fall back to 'keep everything'."""
-    kept = rank_tools("ترجم هذا النص إلى الإنجليزية", big_toolset(25), 5, hard_cap=True)
-    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
-    assert len(kept) < 25
-
-
-def test_apply_selective_pruning_hard_caps_an_arabic_prompt():
-    settings = load_settings(env={})
-    kept, dropped = apply_selective_pruning(settings, ARABIC_PROMPT, big_toolset(25))
-
-    assert dropped > 0
-    assert len(kept) <= DEFAULT_SELECTIVE_TOOL_LIMIT
-    assert {"bash", "read_file"}.issubset(set(names(kept)))
-
-
-async def test_gateway_caps_an_arabic_prompt_to_five_tools(
-    settings, store, memory, mock_state
-):
-    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
+    tuned = replace(settings, classifier_mode="local_jev")
     app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://gw", timeout=30.0
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "mock-model",
-                "stream": True,
-                "messages": [{"role": "user", "content": ARABIC_PROMPT}],
-                "tools": big_toolset(25),
-            },
-        )
-
-    assert response.status_code == 200
-    after = int(response.headers["x-proxy-tools-after"])
-    assert after <= 5, "the hard cap must hold for a non-English prompt"
-
-    sent = [tool["function"]["name"] for tool in mock_state.bodies[-1]["tools"]]
-    assert len(sent) == after
-    assert "bash" in sent and "read_file" in sent
-
-
-def _toolloop_messages(tool_name: str = "web_search") -> list:
-    """A conversation sitting mid tool-call, waiting on one result."""
-    return [
-        {"role": "user", "content": "search the web for tutorials"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": "{}"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "results"},
+    input_tools = [
+        anthropic_tool("bash", "Run command"),
+        anthropic_tool("read_file", "Read file"),
+        anthropic_tool("spotify", "Music"),
     ]
+    routed_result = RoutedToolList([input_tools[0], input_tools[1]])
+    routed_result.selected_names = ["bash", "read_file"]
+
+    transport = httpx.ASGITransport(app=app)
+    with patch("src.gateway.route_tools_via_jev", new=AsyncMock(return_value=routed_result)):
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw", timeout=30.0) as client:
+            response = await client.post(
+                "/v1/messages",
+                headers={"anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-3-opus",
+                    "messages": [{"role": "user", "content": "inspect codebase"}],
+                    "tools": input_tools,
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.headers["x-proxy-route"] == "Jev-Routed (2 tools)"
+    assert response.headers["x-proxy-tool-action"] == "Retained-Semantic"
+    sent = [_tool_name(t) for t in mock_state.bodies[-1]["tools"]]
+    assert sent == ["bash", "read_file"]
 
 
-async def test_tool_turn_does_not_expand_back_to_the_full_catalog(
-    settings, store, memory, mock_state
-):
-    """A mid-loop turn must not silently re-expand the schema."""
-    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
-    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
-
-    messages = [
-        {"role": "user", "content": "search the web for tutorials"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
+# ------------------------------------------------------------------------------
+# Phase 3: Dashboard & Telemetry formatting
+# ------------------------------------------------------------------------------
+def test_dashboard_recent_requests_formats_selected_tools(tmp_path):
+    log_file = tmp_path / "audit.jsonl"
+    with log_file.open("w") as f:
+        f.write(
+            json.dumps(
                 {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "web_search", "arguments": "{}"},
+                    "ts": 1727330000,
+                    "route": "Jev-Routed (2 tools)",
+                    "tools_before": 20,
+                    "tools_after": 2,
+                    "selected_tools": ["bash", "read_file"],
+                    "latency_ms": 35.4,
                 }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "results"},
-    ]
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://gw", timeout=30.0
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "mock-model",
-                "stream": True,
-                "messages": messages,
-                "tools": big_toolset(25),
-            },
+            )
+            + "\n"
         )
 
-    assert response.status_code == 200
-    after = int(response.headers["x-proxy-tools-after"])
-    assert after <= 5, "a tool turn must not re-expand the catalog"
+    analytics = Analytics(log_file)
+    feed = recent_requests(analytics)
+    assert len(feed) == 1
+    assert feed[0]["route"] == "Jev-Routed (2 tools)"
+    assert feed[0]["tools"] == "20 → 2 [bash, read_file]"
+    assert feed[0]["latency"] == "35ms"
 
 
-async def test_tool_loop_keeps_the_active_tool_inside_the_cap(
-    settings, store, memory, mock_state
-):
-    """The tool the upstream is mid-call on must survive the ceiling."""
-    tuned = type(settings)(**{**settings.__dict__, "selective_tool_limit": 5})
-    app = create_app(settings=tuned, classifier=None, store=store, memory=memory)
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://gw", timeout=30.0
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "mock-model",
-                "stream": True,
-                "messages": _toolloop_messages("web_search"),
-                "tools": big_toolset(49),
-            },
-        )
-
-    assert response.status_code == 200
-    after = int(response.headers["x-proxy-tools-after"])
-    assert after <= 5, "the ToolLoop ceiling is absolute, even for 49 tools"
-    sent = [tool["function"]["name"] for tool in mock_state.bodies[-1]["tools"]]
-    assert "web_search" in sent, "the pending call's tool must stay offered"
-    for name in sent:
-        assert name == "web_search" or name in CORE_TOOLS
-
-
-def test_prune_for_tool_loop_strictly_caps_to_five_tools():
-    tools = big_toolset(49)
-    kept, dropped = prune_for_tool_loop(tools, active_tools=["spotify_play"], limit=5)
-    assert len(kept) <= 5
-    assert dropped == 44
-    kept_names = names(kept)
-    assert "spotify_play" in kept_names
-    for name in kept_names:
-        assert name == "spotify_play" or name in CORE_TOOLS
-
-
-def test_apply_selective_pruning_must_keep_never_overflows_the_limit():
-    settings = load_settings(env={"SELECTIVE_TOOL_LIMIT": "5"})
-    tools = big_toolset(49)
-
-    kept, dropped = apply_selective_pruning(
-        settings, "unrelated prompt about penguins", tools, must_keep=["spotify_play"]
-    )
-
-    assert len(kept) <= 5
-    assert dropped == len(tools) - len(kept)
-    assert "spotify_play" in names(kept), "the pending call's tool is displaced in, not appended past the cap"
-
-
-def test_apply_selective_pruning_requires_never_shrinks_below_the_cap():
-    settings = load_settings(env={"SELECTIVE_TOOL_LIMIT": "5"})
-    tools = big_toolset(49)
-
-    kept, _ = apply_selective_pruning(
-        settings,
-        "send an email to alice about the meeting",
-        tools,
-        must_keep=["send_email", "calendar_create", "sql_query", "image_generate", "weather"],
-    )
-
-    assert len(kept) <= 5
-    kept_names = set(names(kept))
-    assert {"send_email", "calendar_create"} <= kept_names
-    assert "send_email" in kept_names
+def test_pruned_routes_includes_jev_strip():
+    assert "Jev-Strip" in PRUNED_ROUTES

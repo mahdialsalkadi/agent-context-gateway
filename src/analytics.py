@@ -36,7 +36,7 @@ CHARS_PER_TOKEN = 4.0
 TOKENS_PER_TOOL_PROPERTY = 25.0
 TOOL_SCHEMA_OVERHEAD_TOKENS = 30.0
 
-PRUNED_ROUTES = ("FastPath-Strip", "Classifier-Strip")
+PRUNED_ROUTES = ("FastPath-Strip", "Classifier-Strip", "Jev-Strip")
 
 
 def estimate_tokens(text: str) -> int:

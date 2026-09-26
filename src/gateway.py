@@ -57,10 +57,14 @@ from .classifier import (
     ESCAPE_TOKEN,
     Classifier,
     decide_route,
+    evaluate_fast_path,
     get_classifier,
     inject_escape_instruction,
-    rank_tools,
+    is_reasoning_model,
+    route_tools_via_jev,
     strip_escape_instruction,
+    _tool_name,
+    _tool_description,
 )
 from .config import (
     SELECTIVE_PRUNING_MIN_TOOLS,
@@ -191,95 +195,35 @@ async def _close_quietly(
             pass
 
 
+def extract_execution_context(messages: List[Dict[str, Any]]) -> str:
+    """Extract context from conversation history for execution-aware tool routing."""
+    parts: List[str] = []
+    for msg in messages[-6:]:
+        role = msg.get("role")
+        content = text_of(msg.get("content"))
+        if role == "user" and content:
+            parts.append(f"User Request: {content[:400]}")
+        elif role == "assistant" and msg.get("tool_calls"):
+            calls = [
+                c.get("function", {}).get("name")
+                for c in msg.get("tool_calls", [])
+                if isinstance(c, dict)
+            ]
+            parts.append(f"Tools Invoked: {', '.join(filter(None, calls))}")
+        elif role in ("tool", "function") and content:
+            tool_id = msg.get("tool_call_id") or msg.get("name") or "tool"
+            parts.append(f"Tool Result ({tool_id}): {content[:400]}")
+    return "\n".join(parts)
+
+
 def apply_selective_pruning(
     settings: Settings,
     prompt: str,
     tools: List[Dict[str, Any]],
     must_keep: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Shrink a large tool schema to the tools this turn can actually need.
-
-    Returns (tools, dropped_count). Only fires above
-    SELECTIVE_PRUNING_MIN_TOOLS, but from there it is an *absolute* cap:
-    `rank_tools` is called in hard-cap mode, so no prompt -- including one in a
-    language BM25 cannot read -- can return the whole catalog, and the result is
-    always `<= settings.selective_tool_limit`.
-
-    `must_keep` names tools the conversation is already mid-call on (a tool
-    turn). They are guaranteed inside the ceiling -- displacing the weakest
-    ranked pick, never overflowing it -- so the model always receives the schema
-    it is about to be answered for.
-    """
-    if (
-        not settings.enable_selective_pruning
-        or not isinstance(tools, list)
-        or len(tools) <= SELECTIVE_PRUNING_MIN_TOOLS
-    ):
-        return tools, 0
-    try:
-        kept = rank_tools(
-            prompt, tools, settings.selective_tool_limit, hard_cap=True
-        )
-        if must_keep:
-            kept = _ensure_present(kept, tools, must_keep, settings.selective_tool_limit)
-    except Exception:
-        return tools, 0
-    if len(kept) >= len(tools):
-        return tools, 0
-    return kept, len(tools) - len(kept)
-
-
-def _tool_name(tool: Any) -> str:
-    """The tool's name in either the OpenAI or Anthropic payload shape."""
-    if not isinstance(tool, dict):
-        return ""
-    function = tool.get("function")
-    if isinstance(function, dict):
-        return str(function.get("name") or "")
-    return str(tool.get("name") or "")
-
-
-def _ensure_present(
-    kept: List[Dict[str, Any]],
-    tools: List[Dict[str, Any]],
-    must_keep: List[str],
-    limit: int,
-) -> List[Dict[str, Any]]:
-    """Fold `must_keep` into `kept` without ever exceeding `limit` entries.
-
-    A pending call the upstream is mid-answer on outranks every heuristic: if it
-    was displaced by the ranker, the weakest non-required tool gives way. Order
-    follows the original payload so prompt caches stay warm.
-    """
-    required = {name for name in must_keep if name}
-    if not required:
-        return kept
-    kept_names = {_tool_name(tool) for tool in kept}
-    missing = [name for name in must_keep if name not in kept_names]
-    if not missing:
-        return kept
-
-    result = list(kept)
-    for name in missing:
-        if any(_tool_name(tool) == name for tool in result):
-            continue
-        source = next(
-            (tool for tool in tools if _tool_name(tool) == name), None
-        )
-        if source is None:
-            continue
-        if len(result) < limit:
-            result.append(source)
-            continue
-        # Displace the weakest entry that is not itself required.
-        for index in reversed(range(len(result))):
-            if _tool_name(result[index]) not in required:
-                result[index] = source
-                break
-    # Restore payload order for the returned subset.
-    kept_order = {_tool_name(tool): index for index, tool in enumerate(tools)}
-    result.sort(key=lambda tool: kept_order.get(_tool_name(tool), len(tools)))
-    return result
+    """Deprecated legacy shim -- semantic routing is handled via route_tools_via_jev."""
+    return tools, 0
 
 
 def prune_for_tool_loop(
@@ -287,49 +231,8 @@ def prune_for_tool_loop(
     active_tools: List[str],
     limit: int = 5,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Hard-cap the tools in ToolLoop strictly to <= 5 tools (active tool + CORE_TOOLS).
-
-    Ensures requests in a multi-turn tool cycle (`role: "tool"`) NEVER leak the full
-    catalog (49 tools).
-    """
-    if not isinstance(tools, list) or not tools:
-        return tools, 0
-    if len(tools) <= limit:
-        return tools, 0
-
-    tool_by_name = {_tool_name(t): t for t in tools}
-
-    # 1. Active tool(s) first
-    selected_names: List[str] = []
-    for name in active_tools:
-        if name in tool_by_name and name not in selected_names:
-            selected_names.append(name)
-            if len(selected_names) >= limit:
-                break
-
-    # 2. CORE_TOOLS to fill up to limit
-    if len(selected_names) < limit:
-        for tool in tools:
-            name = _tool_name(tool)
-            if name in CORE_TOOLS and name not in selected_names:
-                selected_names.append(name)
-                if len(selected_names) >= limit:
-                    break
-
-    # 3. Fallback to remaining tools if still fewer than limit
-    if len(selected_names) < limit:
-        for tool in tools:
-            name = _tool_name(tool)
-            if name not in selected_names:
-                selected_names.append(name)
-                if len(selected_names) >= limit:
-                    break
-
-    kept = [tool_by_name[name] for name in selected_names if name in tool_by_name]
-    # Preserve original order from tools list for cache stability
-    order = {_tool_name(t): i for i, t in enumerate(tools)}
-    kept.sort(key=lambda t: order.get(_tool_name(t), len(tools)))
-    return kept, len(tools) - len(kept)
+    """Deprecated legacy shim -- tool loop routing is handled via route_tools_via_jev."""
+    return tools, 0
 
 
 def head_could_be_escape(text: str) -> bool:
@@ -654,57 +557,96 @@ def create_app(
             return len(current) if isinstance(current, list) else 0
 
         # 3. Route.
+        forced_tools = body.get("tool_choice") in ("required",) or isinstance(
+            body.get("tool_choice"), dict
+        )
         last_role = messages[-1].get("role") if messages else ""
         is_tool_turn = last_role in ("tool", "function", "tool_call")
-        decision = await decide_route(cfg(), klass(), model, prompt, has_tools, is_tool_turn)
-        route, tool_action = decision.route, decision.tool_action
+
+        selected_tool_names: List[str] = []
+        created_escape_message = False
+        decision_reason = ""
+
+        if not has_tools:
+            route = "Default"
+            tool_action = "Unmodified"
+            decision_reason = "no_tools"
+        elif forced_tools:
+            route = "ForcedToolChoice"
+            tool_action = "Retained-Forced"
+            decision_reason = "forced_tool_choice"
+            selected_tool_names = [_tool_name(t) for t in tools]
+        elif is_reasoning_model(model, cfg().extra_reasoning_patterns):
+            route = "Reasoning-Passthrough"
+            tool_action = "Retained-Full"
+            decision_reason = "reasoning_model"
+            selected_tool_names = [_tool_name(t) for t in tools]
+        elif cfg().effective_classifier_mode == "local_jev":
+            fast_path = evaluate_fast_path(prompt)
+            if fast_path == "strip_tools" and not is_tool_turn:
+                body.pop("tools", None)
+                body.pop("tool_choice", None)
+                created_escape_message = inject_escape_instruction(messages)
+                route = "FastPath-Strip"
+                tool_action = "Stripped-ZeroTokens"
+                decision_reason = "fast_path"
+            else:
+                exec_context = extract_execution_context(messages) if is_tool_turn else None
+                routed = await route_tools_via_jev(
+                    prompt=prompt,
+                    tools=tools,
+                    client=upstream_client(),
+                    settings=cfg(),
+                    context=exec_context,
+                )
+                err = getattr(routed, "error", None)
+                if err:
+                    route = "Jev-Router-FailOpen"
+                    tool_action = "Retained-Classifier"
+                    selected_tool_names = [_tool_name(t) for t in tools]
+                    decision_reason = f"error: {err}"
+                elif not routed:
+                    body.pop("tools", None)
+                    body.pop("tool_choice", None)
+                    created_escape_message = inject_escape_instruction(messages)
+                    route = "Jev-Strip"
+                    tool_action = "Stripped-ZeroTokens"
+                    decision_reason = "jev_empty"
+                else:
+                    body["tools"] = list(routed)
+                    selected_tool_names = getattr(
+                        routed, "selected_names", [_tool_name(t) for t in routed]
+                    )
+                    route = f"Jev-Routed ({len(routed)} tools)"
+                    tool_action = "Retained-Semantic"
+                    decision_reason = "jev_routed"
+        else:
+            decision = await decide_route(
+                cfg(), klass(), model, prompt, has_tools, is_tool_turn=is_tool_turn
+            )
+            route, tool_action, decision_reason = decision.route, decision.tool_action, decision.reason
+            if decision.stripped:
+                body.pop("tools", None)
+                body.pop("tool_choice", None)
+                created_escape_message = inject_escape_instruction(messages)
+            else:
+                selected_tool_names = [_tool_name(t) for t in tools]
 
         if has_tools and not is_tool_turn:
             try:
                 spill_count = artifacts().truncate_tool_outputs(messages, session_id)
             except Exception:
                 spill_count = 0
-            # Characters of tool output the upstream will not see -- what the
-            # analytics engine books as the spillover saving.
             try:
                 spilled_chars = artifacts().last_truncated_chars
             except Exception:
                 spilled_chars = 0
-
-        created_escape_message = False
-        # Selective sub-tool pruning: with a large schema, keep only the tools
-        # this prompt implies instead of choosing between everything and nothing.
-        # Must precede the all-or-nothing strip so a stripped turn cannot rank.
-        # Note the absence of `not is_tool_turn`: a mid-loop turn must not
-        # silently expand back to the full catalog just because the model is
-        # waiting on a result. The cap is unconditional: on a tool turn it
-        # hard-caps strictly to <= 5 tools (active tool + CORE_TOOLS), ensuring a
-        # 49-tool catalog can never leak through a multi-turn tool cycle.
-        selective_count = 0
-        if (
-            has_tools
-            and not decision.stripped
-            and body.get("tool_choice") in (None, "auto")
-        ):
-            if is_tool_turn:
-                pending: List[str] = []
-                for name, _args in iter_tool_call_refs(messages).values():
-                    if name and name not in pending:
-                        pending.append(name)
-                tools, selective_count = prune_for_tool_loop(
-                    tools, pending, limit=min(5, cfg().selective_tool_limit or 5)
-                )
-            else:
-                tools, selective_count = apply_selective_pruning(cfg(), prompt, tools)
-            if selective_count:
-                body["tools"] = tools
-                has_tools = bool(tools)
-
-        created_escape_message = False
-        if decision.stripped:
-            body.pop("tools", None)
-            body.pop("tool_choice", None)
-            created_escape_message = inject_escape_instruction(messages)
+            if spill_count > 0 and body.get("tools"):
+                t_names = [_tool_name(t) for t in body["tools"]]
+                if "fetch_log" not in t_names:
+                    body["tools"].append(FETCH_LOG_TOOL)
+                    if "fetch_log" not in selected_tool_names:
+                        selected_tool_names.append("fetch_log")
 
         # 4. Inject recalled facts.
         if (not is_tool_turn or cfg().memory_inject_tool_turns) and prompt and cfg().memory_injection:
@@ -765,7 +707,8 @@ def create_app(
         # the sniff must leave the iterator positioned for the relay below.
         iterator: AsyncIterator[bytes] = upstream.aiter_raw()
         prefetched: Optional[List[bytes]] = None
-        if decision.stripped:
+        decision_stripped = tool_action.startswith("Stripped") or bool(created_escape_message)
+        if decision_stripped:
             try:
                 prefetched, escaped = await sniff_for_escape(
                     iterator,
@@ -819,11 +762,13 @@ def create_app(
         elapsed = (time.perf_counter() - started) * 1000
         audit({
             "req_id": req_id, "surface": "openai", "session_id": session_id, "model": model,
-            "route": route, "tool_action": tool_action, "reason": decision.reason,
+            "route": route, "tool_action": tool_action, "reason": decision_reason,
             "spill_count": spill_count, "intercepted": intercepted,
             "spilled_chars": spilled_chars,
             "tools_before": tools_before, "tools_after": tools_sent(),
-            "selective_dropped": selective_count,
+            "selected_tools": selected_tool_names,
+            "selected_tool_count": len(selected_tool_names),
+            "selective_dropped": max(0, tools_before - tools_sent()),
             "latency_ms": round(elapsed, 2),
         })
         return StreamingResponse(
@@ -916,40 +861,79 @@ def create_app(
         prompt = last_user_text(norm_messages)
         tools = translated.get("tools")
         has_tools = isinstance(tools, list) and bool(tools)
+        tools_before = len(tools) if has_tools else 0
 
-        decision = await decide_route(
-            cfg(), klass(), model, prompt, has_tools, is_tool_turn=is_tool_turn
-        )
-        # Never prune when the caller demanded a specific tool.
-        if forced_tools and decision.stripped:
-            decision.route = f"{decision.route}->ForcedToolChoice"
-            decision.tool_action = "Retained-Forced"
+        def tools_sent() -> int:
+            current = translated.get("tools")
+            return len(current) if isinstance(current, list) else 0
 
-        route, tool_action = decision.route, decision.tool_action
+        selected_tool_names: List[str] = []
+        decision_reason = ""
 
-        # Same absolute cap on the Anthropic surface: a large schema is never
-        # forwarded whole. Skipped for an explicit tool choice and for an
-        # all-or-nothing strip, which removes the schema entirely.
-        if has_tools and not forced_tools and not decision.stripped:
-            if is_tool_turn:
-                pending = []
-                for name, _args in iter_tool_call_refs(norm_messages).values():
-                    if name and name not in pending:
-                        pending.append(name)
-                pruned, dropped = prune_for_tool_loop(
-                    tools, pending, limit=min(5, cfg().selective_tool_limit or 5)
-                )
+        if not has_tools:
+            route = "Default"
+            tool_action = "Unmodified"
+            decision_reason = "no_tools"
+        elif forced_tools:
+            route = "ForcedToolChoice"
+            tool_action = "Retained-Forced"
+            decision_reason = "forced_tool_choice"
+            selected_tool_names = [_tool_name(t) for t in tools]
+        elif is_reasoning_model(model, cfg().extra_reasoning_patterns):
+            route = "Reasoning-Passthrough"
+            tool_action = "Retained-Full"
+            decision_reason = "reasoning_model"
+            selected_tool_names = [_tool_name(t) for t in tools]
+        elif cfg().effective_classifier_mode == "local_jev":
+            fast_path = evaluate_fast_path(prompt)
+            if fast_path == "strip_tools" and not is_tool_turn:
+                translated.pop("tools", None)
+                translated.pop("tool_choice", None)
+                inject_escape_instruction(norm_messages)
+                route = "FastPath-Strip"
+                tool_action = "Stripped-ZeroTokens"
+                decision_reason = "fast_path"
             else:
-                pruned, dropped = apply_selective_pruning(cfg(), prompt, tools)
-            if dropped:
-                translated["tools"] = pruned
-                tools = pruned
-                has_tools = bool(pruned)
-
-        if decision.stripped:
-            translated.pop("tools", None)
-            translated.pop("tool_choice", None)
-            inject_escape_instruction(normalize_messages(translated))
+                exec_context = extract_execution_context(norm_messages) if is_tool_turn else None
+                routed = await route_tools_via_jev(
+                    prompt=prompt,
+                    tools=tools,
+                    client=upstream_client(),
+                    settings=cfg(),
+                    context=exec_context,
+                )
+                err = getattr(routed, "error", None)
+                if err:
+                    route = "Jev-Router-FailOpen"
+                    tool_action = "Retained-Classifier"
+                    selected_tool_names = [_tool_name(t) for t in tools]
+                    decision_reason = f"error: {err}"
+                elif not routed:
+                    translated.pop("tools", None)
+                    translated.pop("tool_choice", None)
+                    inject_escape_instruction(norm_messages)
+                    route = "Jev-Strip"
+                    tool_action = "Stripped-ZeroTokens"
+                    decision_reason = "jev_empty"
+                else:
+                    translated["tools"] = list(routed)
+                    selected_tool_names = getattr(
+                        routed, "selected_names", [_tool_name(t) for t in routed]
+                    )
+                    route = f"Jev-Routed ({len(routed)} tools)"
+                    tool_action = "Retained-Semantic"
+                    decision_reason = "jev_routed"
+        else:
+            decision = await decide_route(
+                cfg(), klass(), model, prompt, has_tools, is_tool_turn=is_tool_turn
+            )
+            route, tool_action, decision_reason = decision.route, decision.tool_action, decision.reason
+            if decision.stripped:
+                translated.pop("tools", None)
+                translated.pop("tool_choice", None)
+                inject_escape_instruction(norm_messages)
+            else:
+                selected_tool_names = [_tool_name(t) for t in tools]
 
         client = upstream_client()
         client_auth = client_upstream_auth(request, cfg().gateway_api_key)
@@ -972,7 +956,11 @@ def create_app(
         elapsed = (time.perf_counter() - started) * 1000
         audit({
             "req_id": req_id, "surface": "anthropic", "session_id": session_id, "model": model,
-            "route": route, "tool_action": tool_action, "reason": decision.reason,
+            "route": route, "tool_action": tool_action, "reason": decision_reason,
+            "tools_before": tools_before, "tools_after": tools_sent(),
+            "selected_tools": selected_tool_names,
+            "selected_tool_count": len(selected_tool_names),
+            "selective_dropped": max(0, tools_before - tools_sent()),
             "streaming": streaming, "latency_ms": round(elapsed, 2),
         })
 
@@ -987,7 +975,7 @@ def create_app(
         if not streaming:
             payload = await upstream.aread()
             await _close_quietly(upstream, client)
-            headers = telemetry(route, tool_action, elapsed, 0, req_id)
+            headers = telemetry(route, tool_action, elapsed, 0, req_id, 0, (tools_before, tools_sent()))
             try:
                 parsed = json.loads(payload)
             except Exception:
@@ -1033,7 +1021,7 @@ def create_app(
             anthropic_body(),
             media_type="text/event-stream",
             headers={
-                **telemetry(route, tool_action, elapsed, 0, req_id),
+                **telemetry(route, tool_action, elapsed, 0, req_id, 0, (tools_before, tools_sent())),
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
             },

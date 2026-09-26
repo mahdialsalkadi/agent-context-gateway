@@ -114,7 +114,7 @@ const $ = (id) => document.getElementById(id);
 const badgeClass = (route) =>
   route.includes("Strip") ? "badge strip"
   : route.includes("Passthrough") ? "badge pass"
-  : route.includes("Selective") ? "badge sel"
+  : (route.includes("Selective") || route.includes("Jev-Routed")) ? "badge sel"
   : "badge keep";
 
 function badgeFor(route) {
@@ -303,8 +303,12 @@ def recent_requests(analytics, limit: int = 20) -> list:
         ts = entry.get("ts") or 0
         before = entry.get("tools_before")
         after = entry.get("tools_after")
+        selected_tools = entry.get("selected_tools")
         if isinstance(before, int) and isinstance(after, int) and after:
-            tools = f"{before} → {after}"
+            if selected_tools and isinstance(selected_tools, list):
+                tools = f"{before} → {after} [{', '.join(selected_tools)}]"
+            else:
+                tools = f"{before} → {after}"
         elif isinstance(before, int):
             tools = f"{before} → 0"
         else:
