@@ -124,6 +124,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     settings = load_settings()
     settings.ensure_dirs()
 
+    if settings.effective_classifier_mode == "local_jev":
+        from .jev_lifecycle import ensure_local_jev_running
+
+        ensure_local_jev_running(settings)
+
     if args.daemon:
         return _start_daemon(args, settings)
 
@@ -135,6 +140,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         return gateway_main([])
     finally:
         _clear_pid()
+        if settings.effective_classifier_mode == "local_jev":
+            from .jev_lifecycle import stop_local_jev
+
+            stop_local_jev(settings)
 
 
 def _start_daemon(args: argparse.Namespace, settings) -> int:
@@ -189,6 +198,14 @@ def _tail(path: Path, lines: int) -> str:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    from .config import load_settings
+
+    settings = load_settings()
+    if settings.effective_classifier_mode == "local_jev":
+        from .jev_lifecycle import stop_local_jev
+
+        stop_local_jev(settings)
+
     pid = _read_pid()
     if not _pid_alive(pid):
         _clear_pid()

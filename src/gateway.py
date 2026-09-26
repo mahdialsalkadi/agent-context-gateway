@@ -1191,6 +1191,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     assert_no_loop(settings)
     settings.ensure_dirs()
 
+    if settings.effective_classifier_mode == "local_jev":
+        from .jev_lifecycle import ensure_local_jev_running
+
+        ensure_local_jev_running(settings)
+
     # Built from the resolved settings, not the import-time module global, so
     # `--profile` actually takes effect.
     app = create_app(settings)
@@ -1238,7 +1243,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         probe.close()
 
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+    try:
+        uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+    finally:
+        if settings.effective_classifier_mode == "local_jev":
+            from .jev_lifecycle import stop_local_jev
+
+            stop_local_jev(settings)
     return 0
 
 
