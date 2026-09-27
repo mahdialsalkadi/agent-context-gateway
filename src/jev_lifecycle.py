@@ -172,9 +172,6 @@ def ensure_local_jev_running(settings: Settings, wait_seconds: float = 8.0) -> b
 
 def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
     """Stop the local Jev llama-server and release VRAM."""
-    if settings.effective_classifier_mode != CLASSIFIER_MODE_LOCAL_JEV:
-        return True
-
     _safe_stderr("[jev] stopping local Jev decision server (releasing VRAM)...\n")
 
     # 1. Stop systemd service if available
@@ -204,10 +201,11 @@ def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
                 pass
     _clear_jev_pid(settings)
 
-    # 3. If any process is still listening on the Jev port, terminate it
-    url = settings.local_jev_url
+    # 3. Terminate any orphan llama-server process bound to port 11435
+    url = getattr(settings, "local_jev_url", "http://127.0.0.1:11435/v1/chat/completions")
     parsed = urlparse(url)
     port = parsed.port or 11435
+    pids = []
     try:
         res = subprocess.run(
             ["fuser", f"{port}/tcp"],
@@ -215,22 +213,35 @@ def stop_local_jev(settings: Settings, wait_seconds: float = 6.0) -> bool:
             text=True,
             timeout=2.0,
         )
-        pids = [int(p) for p in res.stdout.strip().split() if p.isdigit()]
-        for p in pids:
-            try:
-                os.kill(p, signal.SIGTERM)
-            except OSError:
-                pass
-        if pids:
-            time.sleep(0.5)
-            for p in pids:
-                if _pid_alive(p):
-                    try:
-                        os.kill(p, signal.SIGKILL)
-                    except OSError:
-                        pass
+        pids.extend(int(p) for p in res.stdout.strip().split() if p.isdigit())
     except Exception:
         pass
+
+    if not pids:
+        try:
+            res = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            pids.extend(int(p) for p in res.stdout.strip().split() if p.isdigit())
+        except Exception:
+            pass
+
+    for p in set(pids):
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    if pids:
+        time.sleep(0.5)
+        for p in set(pids):
+            if _pid_alive(p):
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
 
     # 4. Verify port is released
     deadline = time.time() + wait_seconds

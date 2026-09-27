@@ -240,7 +240,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
     settings = load_settings()
     keep_jev = getattr(args, "keep_jev", False) or os.environ.get("AGENT_GATEWAY_PRESERVE_JEV") == "1"
-    if settings.effective_classifier_mode == "local_jev" and not keep_jev:
+    if not keep_jev:
         from .jev_lifecycle import stop_local_jev
 
         stop_local_jev(settings)
@@ -254,7 +254,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 "this CLI; refusing to signal a PID we did not record.\n"
             )
             return 1
-        _safe_stderr("[cli] gateway is not running.\n")
+        if not keep_jev:
+            _safe_stderr("[Stopped] Gateway is not running. Local Jev stopped (Ports & VRAM released).\n")
+        else:
+            _safe_stderr("[cli] gateway is not running.\n")
         return 0
 
     try:
@@ -267,11 +270,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
     while _pid_alive(pid) and time.time() < deadline:
         time.sleep(0.2)
     if _pid_alive(pid):
-        os.kill(pid, signal.SIGKILL)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
         time.sleep(0.3)
 
     _clear_pid()
-    _safe_stderr(f"[cli] gateway stopped (pid {pid}).\n")
+    if not keep_jev:
+        _safe_stderr("[Stopped] Gateway and local Jev stopped. Ports & VRAM released.\n")
+    else:
+        _safe_stderr(f"[cli] gateway stopped (pid {pid}).\n")
     return 0
 
 
@@ -937,6 +946,14 @@ RUN_AGENTS = {
         },
         "args": [],
     },
+    "codex": {
+        "binary": "codex",
+        "env": {
+            "OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1",
+            "OPENAI_API_KEY": "dummy",
+        },
+        "args": [],
+    },
 }
 
 
@@ -1292,32 +1309,72 @@ def cmd_install_shim(args: argparse.Namespace) -> int:
 WIZARD_AGENTS = (
     ("1", "hermes", "Hermes Agent"),
     ("2", "claude", "Claude Code"),
-    ("3", "aider", "Aider / Cursor"),
+    ("3", "codex", "Codex"),
     ("4", "standalone", "Standalone Gateway (run in background only)"),
 )
-# Step 3 keeps the three engines every subscription user needs one keystroke
-# away. The remaining specialist modes (local_ollama as a classifier, an
-# external JEV endpoint) live behind "advanced" so the default path stays
-# three questions long.
+
+WIZARD_HERMES_UPSTREAMS = (
+    (
+        "1",
+        "local",
+        "Local Offline Engine (Ollama / llama-server at http://127.0.0.1:11434/v1 - $0)",
+    ),
+    (
+        "2",
+        "commercial",
+        "External Commercial API (OpenRouter, Groq, OpenAI, custom)",
+    ),
+)
+
+WIZARD_SUBSCRIPTION_AGENT_UPSTREAMS = (
+    (
+        "1",
+        "native_skill",
+        "Native Skill Mode (Official Subscription - Zero-Proxy / No local ports needed)",
+    ),
+    (
+        "2",
+        "local",
+        "Local Offline Engine (via Gateway Proxy - $0)",
+    ),
+    (
+        "3",
+        "commercial",
+        "External Commercial API (via Gateway Proxy)",
+    ),
+)
+
+WIZARD_STANDALONE_UPSTREAMS = (
+    ("1", "local", "Local Offline Engine"),
+    ("2", "commercial", "External Commercial API"),
+)
+
+WIZARD_UPSTREAMS = WIZARD_HERMES_UPSTREAMS
+
+# Step 3: consolidated 2 clear, practical choices (advanced available via --advanced flag)
 WIZARD_ENGINES = (
     (
         "1",
         "local_jev",
-        "Local Jev-2B Decision  (Vulkan GPU accelerated, ~20ms, offline)",
+        "Local Jev-2B Decision (Vulkan GPU accelerated, ~20ms, smart semantic router) [Default]",
     ),
     (
         "2",
         "heuristics",
-        "Fast Regex Heuristics  (<1ms, zero latency, fail-open, no model)",
+        "Fast Regex Heuristics (<1ms, rule-based, zero model overhead)",
     ),
+)
+WIZARD_ADVANCED_ENGINES = (
     (
         "3",
         "upstream_reused",
         "Upstream Reused        (asks the provider you already chose to classify)",
     ),
-)
-WIZARD_ADVANCED_ENGINES = (
-    ("4", "local_ollama", "Local Ollama classifier (qwen2.5:0.5b / llama3.2)"),
+    (
+        "4",
+        "local_ollama",
+        "Local Ollama classifier (qwen2.5:0.5b / llama3.2)",
+    ),
     (
         "5",
         "external_jev",
@@ -1334,28 +1391,7 @@ _DEFAULT_UPSTREAM_BY_STRATEGY = {
     "heuristics": "https://api.openai.com/v1",
 }
 
-# Upstream (provider) endpoints, split by what they cost you. Tier 1 is the
-# reason this gateway exists: flat-rate subscriptions and local engines you have
-# already paid for, where every schema the upstream never reads is an hourly
-# message limit you did not spend. Tier 2 is the paid escape hatch, and the only
-# place an API key is ever requested.
-WIZARD_SUBSCRIPTION_UPSTREAMS = (
-    (
-        "1",
-        "local",
-        "Local Offline Engine  (Ollama / llama-server at http://127.0.0.1:11434/v1 - $0)",
-    ),
-)
-WIZARD_COMMERCIAL_UPSTREAMS = (
-    (
-        "2",
-        "commercial",
-        "Custom / Commercial API  (OpenRouter, Groq, OpenAI, or custom URL)",
-    ),
-)
-WIZARD_UPSTREAMS = WIZARD_SUBSCRIPTION_UPSTREAMS + WIZARD_COMMERCIAL_UPSTREAMS
-
-# The commercial sub-menu, reached only from option 2.
+# The commercial sub-menu, reached from option 2 or 3.
 WIZARD_COMMERCIAL = (
     ("1", "openrouter", "OpenRouter                 https://openrouter.ai/api/v1"),
     ("2", "openai", "OpenAI                     https://api.openai.com/v1"),
@@ -1400,19 +1436,26 @@ def wizard_banner(status: str, width: int = 64) -> str:
     )
 
 
-def choose_upstream(input_fn) -> str:
-    """The clean 2-option upstream provider menu."""
+def choose_upstream(input_fn, agent: str = "hermes") -> str:
+    """The clean contextual upstream provider menu."""
     from . import ux
+
+    if agent in ("claude", "codex"):
+        options = WIZARD_SUBSCRIPTION_AGENT_UPSTREAMS
+    elif agent == "standalone":
+        options = WIZARD_STANDALONE_UPSTREAMS
+    else:
+        options = WIZARD_HERMES_UPSTREAMS
 
     while True:
         sys.stderr.write("\nWhere should requests go upstream?\n")
-        for number, _key, label in WIZARD_UPSTREAMS:
+        for number, _key, label in options:
             sys.stderr.write(f"  [{number}] {label}\n")
-        raw = input_fn(f"Select 1-{len(WIZARD_UPSTREAMS)} [1]: ").strip() or "1"
-        for number, key, _label in WIZARD_UPSTREAMS:
+        raw = input_fn(f"Select 1-{len(options)} [1]: ").strip() or "1"
+        for number, key, _label in options:
             if raw == number:
                 return key
-        sys.stderr.write(f"  please enter 1-{len(WIZARD_UPSTREAMS)}\n")
+        sys.stderr.write(f"  please enter 1-{len(options)}\n")
 
 
 def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -1573,6 +1616,20 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         status = "no local LLM detected -- commercial APIs available"
     sys.stderr.write(ux.bold(wizard_banner(status), stream=sys.stderr) + "\n")
 
+    # --- Background Process Check -------------------------------------------
+    running_pid = _read_pid()
+    if _pid_alive(running_pid):
+        prompt_msg = (
+            f"\n[Gateway is currently running (PID: {running_pid})] -> "
+            f"[S]top Gateway | [R]estart | [C]ontinue [C]: "
+        )
+        action = input_fn(prompt_msg).strip().lower() or "c"
+        if action.startswith("s"):
+            cmd_stop(argparse.Namespace())
+            return 0
+        elif action.startswith("r"):
+            cmd_stop(argparse.Namespace(keep_jev=True))
+
     # --- step 1: the agent ---------------------------------------------------
     sys.stderr.write(
         ux.dim("\n── Step 1 · Choose Agent ─────────────────────────────", stream=sys.stderr)
@@ -1583,7 +1640,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     env_path = Path.cwd() / ".env"
     existing = read_env_file(env_path)
 
-    # --- step 2: the upstream ------------------------------------------------
+    # --- step 2: contextual upstream ----------------------------------------
     sys.stderr.write(
         ux.dim(
             "\n── Step 2 · Choose Upstream Provider ─────────────────",
@@ -1591,20 +1648,54 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         )
         + "\n"
     )
-    for number, _key, label in WIZARD_UPSTREAMS:
+    if agent == "hermes":
+        upstream_options = WIZARD_HERMES_UPSTREAMS
+    elif agent in ("claude", "codex"):
+        upstream_options = WIZARD_SUBSCRIPTION_AGENT_UPSTREAMS
+    elif agent == "standalone":
+        upstream_options = WIZARD_STANDALONE_UPSTREAMS
+    else:
+        upstream_options = WIZARD_HERMES_UPSTREAMS
+
+    for number, _key, label in upstream_options:
         sys.stderr.write(f"  [{number}] {label}\n")
 
     provider = ""
-    while provider not in {key for _n, key, _l in WIZARD_UPSTREAMS}:
-        raw = input_fn("Select 1-2 [1]: ").strip() or "1"
+    while provider not in {key for _n, key, _l in upstream_options}:
+        raw = input_fn(f"Select 1-{len(upstream_options)} [1]: ").strip() or "1"
         provider = next(
-            (key for number, key, _l in WIZARD_UPSTREAMS if raw == number), ""
+            (key for number, key, _l in upstream_options if raw == number), ""
         )
+
+    if provider == "native_skill":
+        from .skill_generator import install_skill
+        from .config import load_settings
+        from .jev_lifecycle import ensure_local_jev_running
+
+        settings = load_settings()
+        ensure_local_jev_running(settings)
+        script_path, doc_path = install_skill(target=agent)
+        sys.stderr.write(
+            ux.green(f"\n✔ Native Jev tool router skill installed\n", stream=sys.stderr)
+        )
+        sys.stderr.write(ux.dim(f"  script → {script_path}\n  metadata → {doc_path}\n", stream=sys.stderr))
+        sys.stderr.write(
+            "[Skill Ready] Directly calls local Vulkan Jev (http://127.0.0.1:11435) with $0 subscription usage.\n"
+        )
+        bin_path = resolve_agent_path(agent)
+        if bin_path and launching:
+            sys.stderr.write(f"[Skill Ready] Launching {agent} natively (subscription mode)...\n")
+            return subprocess.run([bin_path]).returncode
+        sys.stderr.write(
+            f"[Skill Ready] Native Jev router installed. Run '{agent}' in your project directory whenever you are ready.\n"
+        )
+        return 0
+
     if provider == "commercial":
         provider = choose("\nWhich commercial provider?", WIZARD_COMMERCIAL, input_fn)
 
     existing_key = existing.get("UPSTREAM_API_KEY", "")
-    anthropic_surface = False
+    anthropic_surface = (agent == "claude")
 
     if provider == "custom":
         default_url = existing.get("UPSTREAM_BASE_URL") or "https://api.openai.com/v1"
@@ -1634,9 +1725,6 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                 )
             )
     elif provider in WIZARD_SUBSCRIPTION_PROVIDERS:
-        # A subscription bridge or local engine never needs a key of ours: the
-        # client's own session is forwarded upstream. Keep a real key if the user
-        # already had one, otherwise satisfy clients that demand a non-empty one.
         api_key = existing_key or WIZARD_PLACEHOLDER_KEY
         note = WIZARD_TIER_NOTES.get(provider)
         if note:
@@ -1650,32 +1738,34 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         )
         + "\n"
     )
-    for number, _key, label in WIZARD_ENGINES:
-        sys.stderr.write(f"    [{number}] {label}\n")
-    sys.stderr.write(ux.dim("  advanced:\n", stream=sys.stderr))
-    for number, _key, label in WIZARD_ADVANCED_ENGINES:
-        sys.stderr.write(f"    [{number}] {label}\n")
-    default_strategy_num = "2"
-    if existing.get("CLASSIFIER_MODE") == "local_jev":
-        default_strategy_num = "1"
-    elif existing.get("CLASSIFIER_MODE") == "upstream_reused":
-        default_strategy_num = "3"
-    elif existing.get("CLASSIFIER_MODE") == "local_ollama":
-        default_strategy_num = "4"
-    elif existing.get("CLASSIFIER_MODE") == "external_jev":
-        default_strategy_num = "5"
-    elif provider == "local" and "local_jev" in services:
-        default_strategy_num = "1"
+    is_advanced = getattr(args, "advanced", False)
+    engines_to_show = WIZARD_STRATEGIES if is_advanced else WIZARD_ENGINES
+    for number, _key, label in engines_to_show:
+        sys.stderr.write(f"  [{number}] {label}\n")
 
+    default_strategy_num = "1"
+    if existing.get("CLASSIFIER_MODE") == "heuristics":
+        default_strategy_num = "2"
+    elif existing.get("CLASSIFIER_MODE") == "upstream_reused":
+        default_strategy_num = "3" if is_advanced else "1"
+    elif existing.get("CLASSIFIER_MODE") == "local_ollama":
+        default_strategy_num = "4" if is_advanced else "1"
+    elif existing.get("CLASSIFIER_MODE") == "external_jev":
+        default_strategy_num = "5" if is_advanced else "1"
+
+    max_choice = len(engines_to_show)
     strategy = ""
-    while strategy not in {key for _n, key, _l in WIZARD_STRATEGIES}:
+    while not strategy:
         raw = (
-            input_fn(f"Select 1-5 [{default_strategy_num}]: ").strip()
+            input_fn(f"Select 1-{max_choice} [{default_strategy_num}]: ").strip()
             or default_strategy_num
         )
-        strategy = next(
-            (key for number, key, _l in WIZARD_STRATEGIES if raw == number), ""
-        )
+        for number, key, _l in WIZARD_STRATEGIES:
+            if raw == number:
+                strategy = key
+                break
+        if not strategy:
+            sys.stderr.write(f"Please select 1-{max_choice}\n")
 
     # `external_jev` is the one strategy that needs its own classifier endpoint.
     classifier_url = ""
@@ -1791,6 +1881,11 @@ def build_parser() -> argparse.ArgumentParser:
             "savings."
         ),
     )
+    parser.add_argument(
+        "--advanced",
+        action="store_true",
+        help="show advanced routing and pruning engines",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     start = subparsers.add_parser("start", help="run the transparent proxy (foreground by default)")
@@ -1884,6 +1979,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     interactive.add_argument(
         "--no-launch", dest="launch", action="store_false", help=argparse.SUPPRESS
+    )
+    interactive.add_argument(
+        "--advanced", action="store_true", help="show advanced routing and pruning engines"
     )
     interactive.add_argument(
         "--port", type=int, default=None, help="override the gateway port (skipped silently otherwise)"

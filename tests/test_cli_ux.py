@@ -676,8 +676,8 @@ def test_cmd_interactive_writes_env_from_answers(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Claude Code, local engine (its base URL), local_jev engine.
-    answers = iter(["2", "1", "", "1"])
+    # Claude Code (2), local engine via proxy (2), its base URL (""), local_jev engine (1).
+    answers = iter(["2", "2", "", "1"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -687,6 +687,34 @@ def test_cmd_interactive_writes_env_from_answers(tmp_path, monkeypatch):
     assert "UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1" in text
 
 
+def test_cmd_interactive_claude_selects_native_skill(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+    installed = {}
+    monkeypatch.setattr(
+        "src.skill_generator.install_skill",
+        lambda target, dest_dir=None: (
+            installed.setdefault("target", target),
+            tmp_path / "jev-router.py",
+            tmp_path / "SKILL.md",
+        )[1:],
+    )
+    monkeypatch.setattr("src.jev_lifecycle.ensure_local_jev_running", lambda settings: True)
+
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    # Claude Code (2), Native Skill Mode (1)
+    answers = iter(["2", "1"])
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    assert installed.get("target") == "claude"
+    err = capsys.readouterr().err
+    assert "Native Jev tool router skill installed" in err
+    assert "Zero-Proxy" in err or "calls local Vulkan Jev" in err
+
+
 def test_cmd_interactive_accepts_a_custom_provider_endpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
     monkeypatch.setattr(
@@ -694,8 +722,8 @@ def test_cmd_interactive_accepts_a_custom_provider_endpoint(tmp_path, monkeypatc
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Aider, commercial tier (2), custom provider (4), URL, key, upstream_reused engine.
-    answers = iter(["3", "2", "4", "https://my.gateway/v1", "sk-custom", "3"])
+    # Codex (3), commercial tier via proxy (3), custom provider (4), URL, key, local_jev engine (1).
+    answers = iter(["3", "3", "4", "https://my.gateway/v1", "sk-custom", "1"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -712,7 +740,7 @@ def test_cmd_interactive_external_jev_prompts_for_the_classifier_endpoint(
         cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
     )
 
-    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    args = cli.build_parser().parse_args(["interactive", "--no-launch", "--advanced"])
     # Hermes, Local engine, base URL, external JEV engine (5), dedicated URL and key.
     answers = iter(["1", "1", "", "5", "https://jev.example/v1", "jev-key"])
     args.input_fn = lambda _prompt: next(answers)
@@ -778,7 +806,23 @@ def test_cmd_interactive_stops_running_gateway_on_reconfigure(tmp_path, monkeypa
     monkeypatch.setattr(cli, "_ensure_gateway_running", lambda: None)
 
     args = cli.build_parser().parse_args(["interactive"])
-    answers = iter(["4", "1", "", "2"])
+    # Answer R to running gateway prompt, then standalone (4), local engine (1), base URL (""), heuristics (2)
+    answers = iter(["R", "4", "1", "", "2"])
+    args.input_fn = lambda _prompt: next(answers)
+
+    assert cmd_interactive(args) == 0
+    assert stopped.get("stopped") is True
+
+
+def test_cmd_interactive_running_gateway_stop_choice(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    stopped = {}
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_read_pid", lambda: 9999)
+    monkeypatch.setattr(cli, "cmd_stop", lambda args: stopped.setdefault("stopped", True))
+
+    args = cli.build_parser().parse_args(["interactive"])
+    answers = iter(["S"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -798,4 +842,55 @@ def test_ensure_gateway_running_stops_stale_pid_when_unhealthy(monkeypatch):
     assert cli._ensure_gateway_running() == 0
     assert stopped.get("stopped") is True
     assert started.get("started") == 0
+
+
+def test_cmd_interactive_hermes_local_vs_external_api(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr(
+        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
+    )
+
+    # 1. Hermes selecting Local (1)
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    answers = iter(["1", "1", "", "1"])
+    args.input_fn = lambda _prompt: next(answers)
+    assert cmd_interactive(args) == 0
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1" in text
+
+    # 2. Hermes selecting External API (2) -> OpenRouter (1)
+    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
+    answers = iter(["1", "2", "1", "sk-or-test", "1"])
+    args.input_fn = lambda _prompt: next(answers)
+    assert cmd_interactive(args) == 0
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "UPSTREAM_BASE_URL=https://openrouter.ai/api/v1" in text
+    assert "UPSTREAM_API_KEY=sk-or-test" in text
+
+
+def test_agent_gateway_stop_signals_shutdown_and_releases_ports(monkeypatch, capsys):
+    import argparse
+    import signal
+
+    killed = []
+    stopped_jev = []
+
+    # Mock pid alive on first call, dead on check loop
+    alive_calls = [True, False]
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: alive_calls.pop(0) if alive_calls else False)
+    monkeypatch.setattr(cli, "_read_pid", lambda: 1234)
+    monkeypatch.setattr(cli, "_clear_pid", lambda: None)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(
+        "src.jev_lifecycle.stop_local_jev",
+        lambda settings: stopped_jev.append(True),
+    )
+
+    # Run agent-gateway stop
+    code = cli.cmd_stop(argparse.Namespace())
+    assert code == 0
+    assert stopped_jev == [True]
+    assert any(sig == signal.SIGTERM for pid, sig in killed)
+    err = capsys.readouterr().err
+    assert "[Stopped] Gateway and local Jev stopped. Ports & VRAM released." in err
 
