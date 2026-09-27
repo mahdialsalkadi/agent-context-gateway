@@ -239,7 +239,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
     from .config import load_settings
 
     settings = load_settings()
-    if settings.effective_classifier_mode == "local_jev":
+    keep_jev = getattr(args, "keep_jev", False) or os.environ.get("AGENT_GATEWAY_PRESERVE_JEV") == "1"
+    if settings.effective_classifier_mode == "local_jev" and not keep_jev:
         from .jev_lifecycle import stop_local_jev
 
         stop_local_jev(settings)
@@ -432,6 +433,14 @@ def _gateway_healthy() -> bool:
 
 def _ensure_gateway_running(owner_pid: Optional[int] = None) -> int:
     """Start the daemon if needed; return 0 when a healthy gateway is up."""
+    from .config import load_settings
+
+    settings = load_settings()
+    if settings.effective_classifier_mode == "local_jev":
+        from .jev_lifecycle import ensure_local_jev_running
+
+        ensure_local_jev_running(settings)
+
     if _gateway_healthy():
         return 0
     if _probe_health(timeout=1.0) is not None:
@@ -443,7 +452,7 @@ def _ensure_gateway_running(owner_pid: Optional[int] = None) -> int:
     # If a previously recorded gateway process is alive but not answering healthily
     # on our configured port/data_dir, stop the stale/misconfigured process first.
     if _pid_alive(_read_pid()):
-        cmd_stop(argparse.Namespace())
+        cmd_stop(argparse.Namespace(keep_jev=True))
     if owner_pid is not None:
         os.environ["AGENT_GATEWAY_OWNER_PID"] = str(owner_pid)
     namespace = argparse.Namespace(daemon=True, profile="", port=None)
@@ -945,20 +954,78 @@ def build_agent_env(agent: str, port: int, api_key: str = "dummy") -> dict:
     return res
 
 
-def build_agent_command(agent: str, extra_args: List[str], port: int) -> List[str]:
+def resolve_agent_path(agent: str) -> Optional[str]:
+    """Find the agent executable binary, searching PATH and known local/npm/nvm locations."""
+    import shutil
+
+    spec = RUN_AGENTS.get(agent)
+    binary = spec["binary"] if spec else agent
+
+    # 1. Standard PATH
+    found = shutil.which(binary)
+    if found:
+        return found
+
+    # 2. Known local / user / package manager paths
+    home = Path.home()
+    candidates: List[Path] = [
+        home / ".local" / "bin" / binary,
+        home / ".npm-global" / "bin" / binary,
+        home / "bin" / binary,
+        Path("/usr/local/bin") / binary,
+        Path("/opt/homebrew/bin") / binary,
+    ]
+
+    # Node / nvm / fnm versions
+    nvm_node_dir = home / ".nvm" / "versions" / "node"
+    if nvm_node_dir.is_dir():
+        try:
+            for p in sorted(nvm_node_dir.glob("*/bin/" + binary), reverse=True):
+                candidates.append(p)
+        except Exception:
+            pass
+
+    candidates.append(home / ".fnm" / "current" / "bin" / binary)
+    try:
+        candidates.append(home / ".local" / "share" / "fnm" / "current" / "bin" / binary)
+    except Exception:
+        pass
+
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+
+    # If claude specifically, try `npm prefix -g` or checking global npm prefix
+    if binary == "claude" or agent == "claude":
+        try:
+            npm = shutil.which("npm")
+            if npm:
+                res = subprocess.run([npm, "prefix", "-g"], capture_output=True, text=True, timeout=2.0)
+                if res.returncode == 0 and res.stdout.strip():
+                    npm_bin = Path(res.stdout.strip()) / "bin" / "claude"
+                    if npm_bin.is_file() and os.access(npm_bin, os.X_OK):
+                        return str(npm_bin)
+        except Exception:
+            pass
+
+    return None
+
+
+def build_agent_command(
+    agent: str, extra_args: List[str], port: int, binary_path: Optional[str] = None
+) -> List[str]:
     """Full argv for the child agent, with gateway flags inserted. Pure."""
     spec = RUN_AGENTS.get(agent)
     if not spec:
         return []
-    command = [spec["binary"]]
+    bin_name = binary_path or spec["binary"]
+    command = [bin_name]
     command.extend(arg.format(port=port) for arg in spec["args"])
     command.extend(extra_args)
     return command
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    import shutil
-
     from . import ux
 
     agent = args.agent
@@ -969,18 +1036,59 @@ def cmd_run(args: argparse.Namespace) -> int:
             ["Known agents: " + ", ".join(sorted(RUN_AGENTS)),
              "For anything else, point the client at http://127.0.0.1:<port>/v1 yourself."],
         )
-    if shutil.which(spec["binary"]) is None:
-        raise CliError(
-            f"{spec['binary']!r} is not installed or not on PATH",
-            [
-                f"Install {spec['binary']} first, then re-run this command.",
-                "Or start only the gateway: agent-gateway start",
-            ],
-        )
+
+    binary_path = resolve_agent_path(agent)
+    if not binary_path:
+        hints = [
+            f"Install {spec['binary']} first, then re-run this command.",
+            "Or start only the gateway: agent-gateway start",
+        ]
+        if agent == "claude":
+            error_msg = (
+                "[Error] 'claude' CLI was not found or is not installed on PATH. "
+                "Install it via 'npm install -g @anthropic-ai/claude-code' "
+                "or use the native skill mode: 'agent-gateway install-skill claude'."
+            )
+            hints = [
+                "Install it via 'npm install -g @anthropic-ai/claude-code'",
+                "Or use the native skill mode: 'agent-gateway install-skill claude'",
+                "Or start in standalone gateway mode: 'agent-gateway start --daemon'",
+            ]
+        else:
+            error_msg = f"[Error] '{spec['binary']}' is not installed or not on PATH"
+
+        input_fn = getattr(args, "input_fn", None)
+        if input_fn is None and getattr(args, "interactive", False) and sys.stdin.isatty():
+            input_fn = input
+
+        if input_fn is not None:
+            sys.stderr.write(f"\n{error_msg}\n\n")
+            sys.stderr.write("What would you like to do?\n")
+            sys.stderr.write("  [1] Start gateway in standalone background mode (--daemon)\n")
+            sys.stderr.write("  [2] Exit\n")
+            choice = input_fn("Select 1-2 [1]: ").strip() or "1"
+            if choice == "1":
+                _ensure_gateway_running()
+                from .config import load_settings
+
+                settings = load_settings()
+                sys.stderr.write(
+                    f"[launcher] gateway ready on :{settings.port} -- point your client at "
+                    f"http://127.0.0.1:{settings.port}/v1\n"
+                )
+                return 0
+            return 1
+
+        raise CliError(error_msg, hints)
 
     from .config import load_settings
 
     settings = load_settings()
+
+    if settings.effective_classifier_mode == "local_jev":
+        from .jev_lifecycle import ensure_local_jev_running
+
+        ensure_local_jev_running(settings)
 
     _ensure_gateway_running(owner_pid=os.getpid())
     sys.stderr.write(
@@ -995,7 +1103,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     environment = os.environ.copy()
     environment.update(agent_env)
 
-    command = build_agent_command(agent, args.agent_args, settings.port)
+    command = build_agent_command(agent, args.agent_args, settings.port, binary_path=binary_path)
     sys.stderr.write(
         ux.dim("[run] env: " + ", ".join(sorted(agent_env)) + "\n", stream=sys.stderr)
     )
@@ -1023,7 +1131,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
         try:
-            cmd_stop(argparse.Namespace())
+            cmd_stop(argparse.Namespace(keep_jev=True))
         except Exception:
             pass
 
@@ -1507,8 +1615,6 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         candidate_existing = existing.get("UPSTREAM_BASE_URL", "")
         if any(h in candidate_existing for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1")):
             default_url = candidate_existing
-        elif "local_jev" in services and "ollama" not in services:
-            default_url = "http://127.0.0.1:11435/v1"
         else:
             default_url = "http://127.0.0.1:11434/v1"
         typed = input_fn(f"Local engine base URL [{default_url}]: ").strip()
@@ -1637,7 +1743,15 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     # When interactive setup writes a new configuration, stop any old
     # gateway process running with previous settings so the new setup takes effect.
     if _pid_alive(_read_pid()):
-        cmd_stop(argparse.Namespace())
+        cmd_stop(argparse.Namespace(keep_jev=True))
+
+    from .config import load_settings
+
+    settings = load_settings()
+    if strategy == "local_jev":
+        from .jev_lifecycle import ensure_local_jev_running
+
+        ensure_local_jev_running(settings)
 
     if agent == "standalone":
         if launching:
@@ -1657,13 +1771,12 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         )
         return 0
 
-    from .config import load_settings
-
-    settings = load_settings()
     sys.stderr.write(
         ux.dim(f"[launcher] starting {agent} through :{settings.port}\n", stream=sys.stderr)
     )
-    return cmd_run(argparse.Namespace(agent=agent, agent_args=[]))
+    return cmd_run(
+        argparse.Namespace(agent=agent, agent_args=[], input_fn=input_fn, interactive=True)
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -1792,11 +1905,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not getattr(args, "func", None):
-        # No arguments: the interactive launcher. In a non-TTY it prints help,
-        # so scripts and pipelines keep the historical behaviour.
-        return cmd_interactive(args)
     try:
+        if not getattr(args, "func", None):
+            # No arguments: the interactive launcher. In a non-TTY it prints help,
+            # so scripts and pipelines keep the historical behaviour.
+            return cmd_interactive(args)
         return args.func(args)
     except CliError as error:
         from . import ux

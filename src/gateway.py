@@ -1275,7 +1275,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
     finally:
-        if settings.effective_classifier_mode == "local_jev":
+        if (
+            settings.effective_classifier_mode == "local_jev"
+            and os.environ.get("AGENT_GATEWAY_PRESERVE_JEV") != "1"
+            and os.environ.get("AGENT_GATEWAY_STOP_JEV_ON_EXIT") == "1"
+        ):
             from .jev_lifecycle import stop_local_jev
 
             stop_local_jev(settings)

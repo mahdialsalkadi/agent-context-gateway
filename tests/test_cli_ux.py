@@ -316,6 +316,80 @@ def test_run_rejects_a_missing_binary_without_a_traceback():
     assert "not installed" in message or "not on PATH" in message
 
 
+def test_resolve_agent_path_checks_npm_and_nvm_locations(tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+
+    # 1. When no binary exists:
+    assert cli.resolve_agent_path("claude") is None
+
+    # 2. When ~/.npm-global/bin/claude exists:
+    npm_claude = tmp_path / ".npm-global" / "bin" / "claude"
+    npm_claude.parent.mkdir(parents=True, exist_ok=True)
+    npm_claude.write_text("#!/bin/sh\necho claude")
+    npm_claude.chmod(0o755)
+    assert cli.resolve_agent_path("claude") == str(npm_claude)
+
+    # Clean up and test nvm path
+    npm_claude.unlink()
+    nvm_claude = tmp_path / ".nvm" / "versions" / "node" / "v20.10.0" / "bin" / "claude"
+    nvm_claude.parent.mkdir(parents=True, exist_ok=True)
+    nvm_claude.write_text("#!/bin/sh\necho claude")
+    nvm_claude.chmod(0o755)
+    assert cli.resolve_agent_path("claude") == str(nvm_claude)
+
+
+def test_cmd_run_missing_claude_interactive_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "resolve_agent_path", lambda _agent: None)
+    started = {}
+    monkeypatch.setattr(cli, "_ensure_gateway_running", lambda: started.setdefault("up", True))
+
+    # Choice 1: start in standalone background mode
+    args = cli.build_parser().parse_args(["run", "claude"])
+    args.input_fn = lambda _prompt: "1"
+    code = cli.cmd_run(args)
+    assert code == 0
+    assert started.get("up") is True
+    err = capsys.readouterr().err
+    assert "[Error] 'claude' CLI was not found" in err
+    assert "agent-gateway install-skill claude" in err
+    assert "gateway ready on" in err
+
+    # Choice 2: exit cleanly
+    args = cli.build_parser().parse_args(["run", "claude"])
+    args.input_fn = lambda _prompt: "2"
+    code = cli.cmd_run(args)
+    assert code == 1
+
+
+def test_cmd_stop_preserves_jev_when_keep_jev_is_set(tmp_path, monkeypatch):
+    import argparse
+    import types
+
+    stopped = {}
+    monkeypatch.setattr(
+        "src.jev_lifecycle.stop_local_jev",
+        lambda settings: stopped.setdefault("stopped", True),
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(cli, "_read_pid", lambda: 0)
+
+    monkeypatch.setattr(
+        "src.config.load_settings",
+        lambda: types.SimpleNamespace(effective_classifier_mode="local_jev", log_dir=tmp_path),
+    )
+    # When keep_jev is False:
+    cli.cmd_stop(argparse.Namespace(keep_jev=False))
+    assert stopped.get("stopped") is True
+
+    # When keep_jev is True:
+    stopped.clear()
+    cli.cmd_stop(argparse.Namespace(keep_jev=True))
+    assert "stopped" not in stopped
+
+
 # ------------------------------------------------------------------------------
 # graceful errors: no tracebacks on predicted failures
 # ------------------------------------------------------------------------------
