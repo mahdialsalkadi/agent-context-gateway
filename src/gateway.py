@@ -1267,6 +1267,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         t = threading.Thread(target=_watchdog_loop, name="owner-watchdog", daemon=True)
         t.start()
 
+    sys.stderr.write(
+        f"[Proxy Ready] Listening on http://{settings.host}:{settings.port} -> "
+        f"Forwarding to {settings.upstream_base_url}\n"
+    )
+
     try:
         uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
     finally:

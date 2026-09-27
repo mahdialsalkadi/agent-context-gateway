@@ -56,8 +56,7 @@ def isolated(tmp_path, monkeypatch):
 def test_antigravity_preset_relaxes_the_loop_guard_and_reuses_gemini():
     preset = build_init_preset("custom", "antigravity", 8091)
 
-    assert preset["UPSTREAM_BASE_URL"] == "http://127.0.0.1:8080/v1"
-    assert preset["ALLOW_LEGACY_UPSTREAM_PORT"] == "1"
+    assert "ALLOW_LEGACY_UPSTREAM_PORT" not in preset
     assert preset["CLASSIFIER_MODE"] == "upstream_reused"
     assert preset["CLASSIFIER_MODEL"] == "gemini-2.5-flash"
     assert preset["GATEWAY_PORT"] == "8091", "must not collide with the bridge on 8080"
@@ -438,7 +437,7 @@ def test_wizard_preset_antigravity_is_keyless_and_relaxes_the_loop_guard():
     )
 
     assert preset["UPSTREAM_BASE_URL"] == "http://127.0.0.1:8080/v1"
-    assert preset["ALLOW_LEGACY_UPSTREAM_PORT"] == "1"
+    assert "ALLOW_LEGACY_UPSTREAM_PORT" not in preset
     assert preset["UPSTREAM_API_KEY"] == "dummy"
 
 
@@ -463,12 +462,12 @@ def test_wizard_preset_honours_a_chosen_endpoint_and_key():
     assert "ALLOW_LEGACY_UPSTREAM_PORT" not in preset
 
 
-def test_wizard_preset_relaxes_the_loop_guard_for_a_bridge():
+def test_wizard_preset_no_legacy_port_needed():
     preset = build_wizard_preset(
         "hermes", "upstream_reused", 8091,
         upstream_url="http://127.0.0.1:8080/v1",
     )
-    assert preset["ALLOW_LEGACY_UPSTREAM_PORT"] == "1"
+    assert "ALLOW_LEGACY_UPSTREAM_PORT" not in preset
 
 
 def test_wizard_preset_carries_the_external_classifier_endpoint():
@@ -686,7 +685,6 @@ def test_cmd_interactive_subscription_bridge_never_prompts_for_a_key(
     assert not any("api key" in p.lower() for p in prompts), prompts
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "UPSTREAM_BASE_URL=http://127.0.0.1:8080/v1" in text
-    assert "ALLOW_LEGACY_UPSTREAM_PORT=1" in text
     assert "UPSTREAM_API_KEY=dummy" in text, "a placeholder satisfies strict clients"
 
 

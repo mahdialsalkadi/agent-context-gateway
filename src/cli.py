@@ -109,6 +109,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 1
 
     # Overrides must be in the environment before settings are resolved.
+    if getattr(args, "upstream_url", None):
+        os.environ["UPSTREAM_BASE_URL"] = args.upstream_url
+    if getattr(args, "upstream_key", None):
+        os.environ["UPSTREAM_API_KEY"] = args.upstream_key
     if args.port:
         os.environ["GATEWAY_PORT"] = str(args.port)
     if args.profile:
@@ -146,6 +150,27 @@ def cmd_start(args: argparse.Namespace) -> int:
             stop_local_jev(settings)
 
 
+def cmd_install_skill(args: argparse.Namespace) -> int:
+    """Generate and install native Jev tool router skill for subscriptions."""
+    from .skill_generator import install_skill, ping_jev
+
+    target = getattr(args, "target", "claude") or "claude"
+    dest = Path(args.dest) if getattr(args, "dest", None) else None
+    script_path, doc_path = install_skill(target=target, dest_dir=dest)
+    sys.stdout.write(f"[Skill Installed] Native Jev tool router skill created at: {script_path}\n")
+    sys.stdout.write(f"[Skill Configured] Metadata written to: {doc_path}\n")
+    sys.stdout.write(
+        "[Skill Ready] Directly calls local Vulkan Jev (http://127.0.0.1:11435) with $0 subscription usage.\n"
+    )
+    if getattr(args, "test", False):
+        alive = ping_jev()
+        if alive:
+            sys.stdout.write("[Skill Test] Local Jev server is ACTIVE.\n")
+        else:
+            sys.stderr.write("[Skill Test] Local Jev server is UNREACHABLE at http://127.0.0.1:11435\n")
+    return 0
+
+
 def _start_daemon(args: argparse.Namespace, settings) -> int:
     """Detach: spawn the gateway into its own session and return immediately."""
     log_path = settings.gateway_log_path
@@ -154,8 +179,13 @@ def _start_daemon(args: argparse.Namespace, settings) -> int:
     environment = os.environ.copy()
     environment.setdefault("PYTHONUNBUFFERED", "1")
 
+    python_bin = sys.executable
+    venv_py = Path.cwd() / ".venv" / "bin" / "python"
+    if venv_py.is_file():
+        python_bin = str(venv_py)
+
     process = subprocess.Popen(
-        [sys.executable, "-m", "src.gateway"],
+        [python_bin, "-m", "src.gateway"],
         env=environment,
         stdout=handle,
         stderr=subprocess.STDOUT,
@@ -177,8 +207,8 @@ def _start_daemon(args: argparse.Namespace, settings) -> int:
             return 1
         if _probe_health(timeout=1.0) is not None:
             sys.stderr.write(
-                f"[cli] gateway running (pid {process.pid}) on "
-                f"http://{settings.label} -- log: {log_path}\n"
+                f"[Proxy Ready] Listening on http://{settings.host}:{settings.port} -> "
+                f"Forwarding to {settings.upstream_base_url} (pid {process.pid})\n"
             )
             return 0
         time.sleep(0.25)
@@ -452,7 +482,7 @@ def detect_local_services(timeout: float = 0.8) -> dict:
     import httpx
 
     found = {}
-    for port, label in ((8080, "antigravity"), (11434, "ollama"), (11435, "local_jev")):
+    for port, label in ((11434, "ollama"), (11435, "local_jev")):
         try:
             response = httpx.get(
                 f"http://127.0.0.1:{port}/v1/models", timeout=timeout
@@ -475,7 +505,6 @@ def build_init_preset(
 
     if backend == "antigravity":
         preset["UPSTREAM_BASE_URL"] = upstream_url or "http://127.0.0.1:8080/v1"
-        preset["ALLOW_LEGACY_UPSTREAM_PORT"] = "1"
         preset["CLASSIFIER_MODE"] = "upstream_reused"
         preset["CLASSIFIER_MODEL"] = "gemini-2.5-flash"
     elif backend == "ollama":
@@ -1370,9 +1399,6 @@ def build_wizard_preset(
     key = api_key or existing.get("UPSTREAM_API_KEY")
     if key:
         preset["UPSTREAM_API_KEY"] = key
-    # The loop guard refuses 8080 by default; a local bridge genuinely lives there.
-    if "127.0.0.1:8080" in upstream or "localhost:8080" in upstream:
-        preset["ALLOW_LEGACY_UPSTREAM_PORT"] = "1"
     if strategy == "local_jev":
         preset["LOCAL_JEV_URL"] = existing.get(
             "LOCAL_JEV_URL", "http://127.0.0.1:11435/v1/chat/completions"
@@ -1680,13 +1706,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    start = subparsers.add_parser("start", help="run the gateway (foreground by default)")
+    start = subparsers.add_parser("start", help="run the transparent proxy (foreground by default)")
     start.add_argument("--profile", help="load .env.NAME instead of .env")
     start.add_argument("--port", type=int, help="override GATEWAY_PORT")
+    start.add_argument("--upstream-url", "-u", help="override UPSTREAM_BASE_URL")
+    start.add_argument("--upstream-key", "-k", help="override UPSTREAM_API_KEY")
     start.add_argument(
         "--daemon", action="store_true", help="detach after the health check passes"
     )
     start.set_defaults(func=cmd_start)
+
+    skill = subparsers.add_parser(
+        "install-skill",
+        help="generate and install native Jev tool router skill for subscriptions (claude, codex, generic)",
+    )
+    skill.add_argument(
+        "target",
+        nargs="?",
+        default="claude",
+        choices=["claude", "codex", "generic"],
+        help="subscription target environment (claude | codex | generic, default: claude)",
+    )
+    skill.add_argument("--dest", help="custom destination directory")
+    skill.add_argument("--test", action="store_true", help="verify local Jev connectivity")
+    skill.set_defaults(func=cmd_install_skill)
 
     stop = subparsers.add_parser("stop", help="stop a gateway started by this CLI")
     stop.set_defaults(func=cmd_stop)

@@ -84,8 +84,7 @@ ESCAPE_INSTRUCTION = (
     f"tools, start output with '{ESCAPE_TOKEN}']"
 )
 
-# Ports a gateway is most likely to be listening on. Used by the loop guard.
-LEGACY_PROXY_PORTS = (8080, 8090)
+# Ports a gateway is listening on forbidden by loop guard (self.port only).
 
 # ------------------------------------------------------------------------------
 # Connection tiers
@@ -423,16 +422,10 @@ class Settings:
     def forbidden_upstreams(self) -> set:
         """(host, port) pairs the upstream may never resolve to.
 
-        The gateway's own listen address is always forbidden -- that is the
-        infinite loop. The legacy proxy ports are forbidden too, but only as a
-        heuristic guess that something proxy-shaped lives there. Local
-        subscription bridges genuinely occupy 8080, so `ALLOW_LEGACY_UPSTREAM_PORT`
-        relaxes the guess without relaxing the real loop guard.
+        The gateway's own listen address is always forbidden to prevent self loops.
         """
         hosts = {self.host.lower(), "127.0.0.1", "localhost", "0.0.0.0", "::1"}
         ports = {self.port}
-        if not self.allow_legacy_upstream:
-            ports.update(LEGACY_PROXY_PORTS)
         return {(host, port) for host in hosts for port in ports}
 
     def is_loop_upstream(self, url: Optional[str] = None) -> bool:
@@ -595,9 +588,7 @@ def load_settings(
         classifier_model=classifier_model,
         classifier_protocol=classifier_protocol,
         classifier_mode=raw_mode or CLASSIFIER_MODE_AUTO,
-        allow_legacy_upstream=_as_bool(
-            _first(env, ("ALLOW_LEGACY_UPSTREAM_PORT",), ""), False
-        ),
+        allow_legacy_upstream=True,
         anthropic_thinking_passthrough=_as_bool(
             _first(env, ("ANTHROPIC_THINKING_PASSTHROUGH",), ""), False
         ),

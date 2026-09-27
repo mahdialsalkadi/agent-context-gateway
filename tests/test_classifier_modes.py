@@ -393,20 +393,16 @@ def test_blueprint_probability_response_still_parses():
 
 
 # ------------------------------------------------------------------------------
-# Loop guard relaxation
+# Loop guard
 # ------------------------------------------------------------------------------
-def test_legacy_port_relaxation_is_opt_in_and_does_not_weaken_the_real_guard():
-    default = load_settings(env={"GATEWAY_PORT": "8091"})
-    relaxed = load_settings(
-        env={"GATEWAY_PORT": "8091", "ALLOW_LEGACY_UPSTREAM_PORT": "1"}
-    )
+def test_real_loop_guard_protects_own_port():
+    settings = load_settings(env={"GATEWAY_PORT": "8091"})
 
-    # 8080 is the Antigravity bridge, so it must be reachable as an upstream...
-    assert default.is_loop_upstream("http://127.0.0.1:8080/v1") is True
-    assert relaxed.is_loop_upstream("http://127.0.0.1:8080/v1") is False
-    # ...while pointing at our own port is still fatal, flag or no flag.
-    assert relaxed.is_loop_upstream("http://127.0.0.1:8091/v1") is True
-    assert relaxed.is_loop_upstream("http://localhost:8091/v1") is True
+    # Other local endpoints are valid upstreams...
+    assert settings.is_loop_upstream("http://127.0.0.1:8080/v1") is False
+    # ...while pointing at our own port is fatal.
+    assert settings.is_loop_upstream("http://127.0.0.1:8091/v1") is True
+    assert settings.is_loop_upstream("http://localhost:8091/v1") is True
 
 
 # ------------------------------------------------------------------------------

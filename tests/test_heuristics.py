@@ -386,10 +386,11 @@ def test_loop_guard_detects_self_reference():
     assert settings.is_loop_upstream() is True
 
 
-def test_loop_guard_detects_legacy_port_and_localhost():
+def test_loop_guard_detects_self_port_and_localhost():
     settings = load_settings(env={"GATEWAY_PORT": "8090"})
-    assert settings.is_loop_upstream("http://localhost:8080/v1") is True
+    assert settings.is_loop_upstream("http://localhost:8090/v1") is True
     assert settings.is_loop_upstream("http://0.0.0.0:8090/v1") is True
+    assert settings.is_loop_upstream("http://127.0.0.1:8090/v1") is True
 
 
 def test_loop_guard_allows_real_providers_and_other_local_ports():
