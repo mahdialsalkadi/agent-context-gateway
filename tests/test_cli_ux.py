@@ -408,44 +408,34 @@ def test_wizard_preset_standalone_has_no_surface_flag():
     assert preset["CLASSIFIER_MODE"] == "heuristics"
 
 
-def test_wizard_puts_flat_rate_subscriptions_first():
+def test_wizard_puts_local_engine_first():
     kinds = [key for _n, key, _l in cli.WIZARD_UPSTREAMS]
 
-    # The free tier is the reason the gateway exists, and it is option 1.
-    assert kinds[0] == "antigravity"
-    assert kinds[:3] == ["antigravity", "claude_session", "local"]
-    assert kinds[-1] == "commercial"
-    assert set(kinds) == {"antigravity", "claude_session", "local", "commercial"}
+    # The 2 clean options: local offline engine first, commercial API second
+    assert kinds[0] == "local"
+    assert kinds[1] == "commercial"
+    assert set(kinds) == {"local", "commercial"}
 
     # The commercial sub-menu still reaches every metered endpoint.
     commercial = {key for _n, key, _l in cli.WIZARD_COMMERCIAL}
     assert {"openrouter", "openai", "groq", "custom"} <= commercial
     assert cli.WIZARD_UPSTREAM_URLS["groq"] == "https://api.groq.com/openai/v1"
 
-    # Tier 1 is exactly the keyless tier, and it never overlaps the keyed one.
-    assert cli.WIZARD_SUBSCRIPTION_PROVIDERS == {"antigravity", "claude_session", "local"}
+    # Local is keyless
+    assert cli.WIZARD_SUBSCRIPTION_PROVIDERS == {"local"}
     assert not (cli.WIZARD_SUBSCRIPTION_PROVIDERS & cli.WIZARD_KEY_PROVIDERS)
 
 
-def test_wizard_preset_antigravity_is_keyless_and_relaxes_the_loop_guard():
+def test_wizard_preset_local_engine_never_inherits_cloud_url():
     preset = build_wizard_preset(
         "hermes",
-        "upstream_reused",
+        "local_ollama",
         8091,
-        upstream_url=cli.WIZARD_UPSTREAM_URLS["antigravity"],
-        api_key=cli.WIZARD_PLACEHOLDER_KEY,
+        existing={"UPSTREAM_BASE_URL": "https://openrouter.ai/api/v1"},
     )
 
-    assert preset["UPSTREAM_BASE_URL"] == "http://127.0.0.1:8080/v1"
-    assert "ALLOW_LEGACY_UPSTREAM_PORT" not in preset
-    assert preset["UPSTREAM_API_KEY"] == "dummy"
-
-
-def test_wizard_preset_claude_session_marks_the_anthropic_surface():
-    preset = build_wizard_preset(
-        "hermes", "heuristics", 8090, anthropic_surface=True
-    )
-    assert preset["ANTHROPIC_SURFACE"] == "1"
+    assert preset["UPSTREAM_BASE_URL"] == "http://127.0.0.1:11434/v1"
+    assert "openrouter" not in preset["UPSTREAM_BASE_URL"]
 
 
 def test_wizard_preset_honours_a_chosen_endpoint_and_key():
@@ -512,23 +502,22 @@ def test_cmd_interactive_is_three_steps_with_a_status_banner(
 ):
     monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
     monkeypatch.setattr(
-        cli, "detect_local_services", lambda timeout=0.8: {"antigravity": {"port": 8080}}
+        cli, "detect_local_services", lambda timeout=0.8: {"local_jev": {"port": 11435}}
     )
     monkeypatch.setattr(
         cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["1", "1", "2"])  # Hermes, Antigravity, heuristics
+    answers = iter(["1", "1", "", "2"])  # Hermes, Local, default URL, heuristics
     args.input_fn = lambda p: next(answers)
 
     assert cmd_interactive(args) == 0
     err = capsys.readouterr().err
-    assert "Antigravity bridge detected on :8080" in err, "the box reports the free tier"
+    assert "Local Jev classifier detected on :11435" in err
     assert "Step 1 · Choose Agent" in err
     assert "Step 2 · Choose Upstream Provider" in err
     assert "Step 3 · Routing & Pruning Engine" in err
-    # The engine menu leads with the GPU-accelerated local decision model.
     assert "Vulkan GPU accelerated" in err
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CLASSIFIER_MODE=heuristics" in text
@@ -547,7 +536,7 @@ def test_cmd_interactive_silently_picks_8091_when_8080_is_busy(
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
     prompts = []
-    answers = iter(["1", "1", "2"])  # Hermes, Antigravity, heuristics
+    answers = iter(["1", "1", "", "2"])  # Hermes, Local, default URL, heuristics
     args.input_fn = lambda p: (prompts.append(p), next(answers))[1]
 
     assert cmd_interactive(args) == 0
@@ -566,7 +555,7 @@ def test_cmd_interactive_port_flag_overrides_silently(tmp_path, monkeypatch):
     args = cli.build_parser().parse_args(
         ["interactive", "--no-launch", "--port", "8123"]
     )
-    answers = iter(["1", "1", "2"])  # Hermes, Antigravity, heuristics
+    answers = iter(["1", "1", "", "2"])  # Hermes, Local, default URL, heuristics
     args.input_fn = lambda _p: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -587,7 +576,7 @@ def test_cmd_interactive_repairs_a_missing_global_shim(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "install_global_wrapper", fake_install)
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["1", "1", "2"])
+    answers = iter(["1", "1", "", "2"])
     args.input_fn = lambda _p: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -613,9 +602,8 @@ def test_cmd_interactive_writes_env_from_answers(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Claude Code, local engine (its base URL), local_jev engine. No port
-    # prompt any more -- the port is chosen silently.
-    answers = iter(["2", "3", "", "1"])
+    # Claude Code, local engine (its base URL), local_jev engine.
+    answers = iter(["2", "1", "", "1"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -632,8 +620,8 @@ def test_cmd_interactive_accepts_a_custom_provider_endpoint(tmp_path, monkeypatc
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Aider, commercial tier, custom provider, URL, key, upstream_reused engine.
-    answers = iter(["3", "4", "4", "https://my.gateway/v1", "sk-custom", "3"])
+    # Aider, commercial tier (2), custom provider (4), URL, key, upstream_reused engine.
+    answers = iter(["3", "2", "4", "https://my.gateway/v1", "sk-custom", "3"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -651,41 +639,14 @@ def test_cmd_interactive_external_jev_prompts_for_the_classifier_endpoint(
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Hermes, Antigravity (keyless, no URL/key prompt), the advanced external
-    # JEV engine, its dedicated classifier endpoint, and its key.
-    answers = iter(["1", "1", "5", "https://jev.example/v1", "jev-key"])
+    # Hermes, Local engine, base URL, external JEV engine (5), dedicated URL and key.
+    answers = iter(["1", "1", "", "5", "https://jev.example/v1", "jev-key"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CLASSIFIER_API_URL=https://jev.example/v1" in text
     assert "CLASSIFIER_API_KEY=jev-key" in text
-
-
-def test_cmd_interactive_subscription_bridge_never_prompts_for_a_key(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(cli, "port_in_use", lambda port, host="127.0.0.1": False)
-    monkeypatch.setattr(
-        cli, "install_global_wrapper", lambda *a, **k: tmp_path / "bin" / "agent-gateway"
-    )
-
-    args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    prompts = []
-    # Hermes, Antigravity, heuristics engine -- and no port question at all.
-    answers = iter(["1", "1", "2"])
-
-    def fake_input(prompt):
-        prompts.append(prompt)
-        return next(answers)
-
-    args.input_fn = fake_input
-
-    assert cmd_interactive(args) == 0
-    assert not any("api key" in p.lower() for p in prompts), prompts
-    text = (tmp_path / ".env").read_text(encoding="utf-8")
-    assert "UPSTREAM_BASE_URL=http://127.0.0.1:8080/v1" in text
-    assert "UPSTREAM_API_KEY=dummy" in text, "a placeholder satisfies strict clients"
 
 
 def test_cmd_interactive_local_engine_never_prompts_for_a_key(tmp_path, monkeypatch):
@@ -696,8 +657,8 @@ def test_cmd_interactive_local_engine_never_prompts_for_a_key(tmp_path, monkeypa
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
     prompts = []
-    # Hermes, local engine, its base URL, heuristics engine.
-    answers = iter(["1", "3", "", "2"])
+    # Hermes, local engine (1), its base URL, heuristics engine (2).
+    answers = iter(["1", "1", "", "2"])
 
     def fake_input(prompt):
         prompts.append(prompt)
@@ -722,8 +683,8 @@ def test_cmd_interactive_standalone_starts_the_gateway(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive"])
-    # standalone, heuristics engine, local engine base URL
-    answers = iter(["4", "2", "3", ""])
+    # standalone (4), local engine (1), base URL (""), heuristics engine (2)
+    answers = iter(["4", "1", "", "2"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -743,7 +704,7 @@ def test_cmd_interactive_stops_running_gateway_on_reconfigure(tmp_path, monkeypa
     monkeypatch.setattr(cli, "_ensure_gateway_running", lambda: None)
 
     args = cli.build_parser().parse_args(["interactive"])
-    answers = iter(["4", "2", "3", ""])
+    answers = iter(["4", "1", "", "2"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0

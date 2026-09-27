@@ -909,7 +909,10 @@ RUN_AGENTS = {
     },
     "hermes": {
         "binary": "hermes",
-        "env": {"OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1"},
+        "env": {
+            "OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1",
+            "OPENAI_API_KEY": "dummy",
+        },
         "args": [],
     },
     "aider": {
@@ -919,20 +922,27 @@ RUN_AGENTS = {
     },
     "cursor": {
         "binary": "cursor-agent",
-        "env": {"OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1"},
+        "env": {
+            "OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1",
+            "OPENAI_API_KEY": "dummy",
+        },
         "args": [],
     },
 }
 
 
-def build_agent_env(agent: str, port: int) -> dict:
+def build_agent_env(agent: str, port: int, api_key: str = "dummy") -> dict:
     """Environment variables to inject for `run`. Pure and testable."""
     spec = RUN_AGENTS.get(agent)
     if not spec:
         return {}
-    return {
-        key: value.format(port=port) for key, value in spec["env"].items()
-    }
+    res = {}
+    for key, value in spec["env"].items():
+        if key == "OPENAI_API_KEY" and api_key:
+            res[key] = api_key
+        else:
+            res[key] = value.format(port=port)
+    return res
 
 
 def build_agent_command(agent: str, extra_args: List[str], port: int) -> List[str]:
@@ -980,12 +990,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     )
 
+    agent_key = settings.upstream_api_key or "dummy"
+    agent_env = build_agent_env(agent, settings.port, agent_key)
     environment = os.environ.copy()
-    environment.update(build_agent_env(agent, settings.port))
+    environment.update(agent_env)
 
     command = build_agent_command(agent, args.agent_args, settings.port)
     sys.stderr.write(
-        ux.dim("[run] env: " + ", ".join(sorted(build_agent_env(agent, settings.port))) + "\n", stream=sys.stderr)
+        ux.dim("[run] env: " + ", ".join(sorted(agent_env)) + "\n", stream=sys.stderr)
     )
     import atexit
 
@@ -1032,7 +1044,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     atexit.register(_cleanup)
     try:
-        proc = subprocess.Popen(command, env=environment)
+        proc = subprocess.Popen(
+            command,
+            env=environment,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
         completed_code = proc.wait()
     except KeyboardInterrupt:
         _cleanup()
@@ -1216,40 +1234,30 @@ _DEFAULT_UPSTREAM_BY_STRATEGY = {
 WIZARD_SUBSCRIPTION_UPSTREAMS = (
     (
         "1",
-        "antigravity",
-        "Google Antigravity Bridge  (Google One Pro subscription - $0 / no key)",
-    ),
-    (
-        "2",
-        "claude_session",
-        "Claude Code Official Session  (Anthropic surface - flat subscription)",
-    ),
-    (
-        "3",
         "local",
-        "Local Offline LLM  (Ollama / llama-server - $0 / no key)",
+        "Local Offline Engine  (Ollama / llama-server at http://127.0.0.1:11434/v1 - $0)",
     ),
 )
 WIZARD_COMMERCIAL_UPSTREAMS = (
-    ("4", "commercial", "Commercial Pay-per-token API  (OpenRouter, Groq, OpenAI, custom)"),
+    (
+        "2",
+        "commercial",
+        "Custom / Commercial API  (OpenRouter, Groq, OpenAI, or custom URL)",
+    ),
 )
 WIZARD_UPSTREAMS = WIZARD_SUBSCRIPTION_UPSTREAMS + WIZARD_COMMERCIAL_UPSTREAMS
 
-# The commercial sub-menu, reached only from option 4.
+# The commercial sub-menu, reached only from option 2.
 WIZARD_COMMERCIAL = (
     ("1", "openrouter", "OpenRouter                 https://openrouter.ai/api/v1"),
     ("2", "openai", "OpenAI                     https://api.openai.com/v1"),
     ("3", "groq", "Groq                       https://api.groq.com/openai/v1"),
     ("4", "custom", "Other OpenAI-compatible endpoint (enter URL + key)"),
 )
-# Tier 1 authenticates with the client's own subscription session, never a key
-# of ours -- so the launcher must not prompt for one.
-WIZARD_SUBSCRIPTION_PROVIDERS = frozenset({"antigravity", "claude_session", "local"})
-# Tier 2 is the only tier that asks for a bearer token.
+WIZARD_SUBSCRIPTION_PROVIDERS = frozenset({"local"})
 WIZARD_KEY_PROVIDERS = frozenset({"openrouter", "openai", "groq", "custom"})
 
 WIZARD_UPSTREAM_URLS = {
-    "antigravity": "http://127.0.0.1:8080/v1",
     "local": "http://127.0.0.1:11434/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "openai": "https://api.openai.com/v1",
@@ -1261,14 +1269,6 @@ WIZARD_UPSTREAM_URLS = {
 WIZARD_PLACEHOLDER_KEY = "dummy"
 
 WIZARD_TIER_NOTES = {
-    "antigravity": (
-        "Using your active Google One Pro subscription via the local Antigravity "
-        "bridge. No API key needed."
-    ),
-    "claude_session": (
-        "Using your Claude Code login session. No API key needed; the gateway "
-        "forwards your session token upstream."
-    ),
     "local": "Fully local and offline. No API key needed.",
 }
 
@@ -1293,29 +1293,12 @@ def wizard_banner(status: str, width: int = 64) -> str:
 
 
 def choose_upstream(input_fn) -> str:
-    """The grouped provider menu: flat-rate tier first, paid tier last.
-
-    Kept separate from the generic `choose` so the two tiers read as headings in
-    the terminal rather than one undifferentiated list -- the free path should be
-    the obvious default, and it is option 1.
-    """
+    """The clean 2-option upstream provider menu."""
     from . import ux
 
     while True:
         sys.stderr.write("\nWhere should requests go upstream?\n")
-        sys.stderr.write(
-            ux.dim(
-                "  -- $0 per token: flat-rate subscriptions & local engines "
-                "(no API key) --\n",
-                stream=sys.stderr,
-            )
-        )
-        for number, _key, label in WIZARD_SUBSCRIPTION_UPSTREAMS:
-            sys.stderr.write(f"  [{number}] {label}\n")
-        sys.stderr.write(
-            ux.dim("-- paid: metered per-token APIs (asks for an API key) --\n", stream=sys.stderr)
-        )
-        for number, _key, label in WIZARD_COMMERCIAL_UPSTREAMS:
+        for number, _key, label in WIZARD_UPSTREAMS:
             sys.stderr.write(f"  [{number}] {label}\n")
         raw = input_fn(f"Select 1-{len(WIZARD_UPSTREAMS)} [1]: ").strip() or "1"
         for number, key, _label in WIZARD_UPSTREAMS:
@@ -1390,11 +1373,19 @@ def build_wizard_preset(
         "GATEWAY_PORT": str(port),
         "CLASSIFIER_MODE": strategy,
     }
-    upstream = (
-        upstream_url
-        or existing.get("UPSTREAM_BASE_URL")
-        or _DEFAULT_UPSTREAM_BY_STRATEGY.get(strategy, "https://api.openai.com/v1")
-    )
+    if upstream_url:
+        upstream = upstream_url
+    elif strategy == "local_ollama":
+        candidate = existing.get("UPSTREAM_BASE_URL", "")
+        if any(h in candidate for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1")):
+            upstream = candidate
+        else:
+            upstream = "http://127.0.0.1:11434/v1"
+    else:
+        upstream = (
+            existing.get("UPSTREAM_BASE_URL")
+            or _DEFAULT_UPSTREAM_BY_STRATEGY.get(strategy, "https://api.openai.com/v1")
+        )
     preset["UPSTREAM_BASE_URL"] = upstream
     key = api_key or existing.get("UPSTREAM_API_KEY")
     if key:
@@ -1464,18 +1455,14 @@ def cmd_interactive(args: argparse.Namespace) -> int:
 
     # --- the box: what is running, where ------------------------------------
     services = detect_local_services()
-    if "antigravity" in services and "local_jev" in services:
-        status = "Antigravity bridge (:8080) & Local Jev (:11435) detected"
-    elif "antigravity" in services:
-        status = "Antigravity bridge detected on :8080"
-    elif "ollama" in services and "local_jev" in services:
+    if "ollama" in services and "local_jev" in services:
         status = "Ollama (:11434) & Local Jev (:11435) detected"
     elif "local_jev" in services:
         status = "Local Jev classifier detected on :11435"
     elif "ollama" in services:
         status = "Ollama detected on :11434"
     else:
-        status = "no local bridge detected -- commercial APIs available"
+        status = "no local LLM detected -- commercial APIs available"
     sys.stderr.write(ux.bold(wizard_banner(status), stream=sys.stderr) + "\n")
 
     # --- step 1: the agent ---------------------------------------------------
@@ -1496,18 +1483,12 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         )
         + "\n"
     )
-    sys.stderr.write(
-        ux.dim("  $0 per token -- flat-rate subscriptions & local engines:\n", stream=sys.stderr)
-    )
-    for number, _key, label in WIZARD_SUBSCRIPTION_UPSTREAMS:
-        sys.stderr.write(f"    [{number}] {label}\n")
-    sys.stderr.write(ux.dim("  paid -- metered per-token APIs:\n", stream=sys.stderr))
-    for number, _key, label in WIZARD_COMMERCIAL_UPSTREAMS:
-        sys.stderr.write(f"    [{number}] {label}\n")
+    for number, _key, label in WIZARD_UPSTREAMS:
+        sys.stderr.write(f"  [{number}] {label}\n")
 
     provider = ""
     while provider not in {key for _n, key, _l in WIZARD_UPSTREAMS}:
-        raw = input_fn("Select 1-4 [1]: ").strip() or "1"
+        raw = input_fn("Select 1-2 [1]: ").strip() or "1"
         provider = next(
             (key for number, key, _l in WIZARD_UPSTREAMS if raw == number), ""
         )
@@ -1515,30 +1496,23 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         provider = choose("\nWhich commercial provider?", WIZARD_COMMERCIAL, input_fn)
 
     existing_key = existing.get("UPSTREAM_API_KEY", "")
-    anthropic_surface = provider == "claude_session"
+    anthropic_surface = False
 
     if provider == "custom":
         default_url = existing.get("UPSTREAM_BASE_URL") or "https://api.openai.com/v1"
         upstream_url = (
             input_fn(f"Upstream base URL [{default_url}]: ").strip() or default_url
         )
-    elif provider == "claude_session":
-        # The session lives behind whatever endpoint Claude Code already uses;
-        # keep the current one when there is one, otherwise assume a local bridge.
-        default_url = (
-            existing.get("UPSTREAM_BASE_URL") or WIZARD_UPSTREAM_URLS["antigravity"]
-        )
-        upstream_url = (
-            input_fn(
-                f"Upstream base URL for the Claude session [{default_url}]: "
-            ).strip()
-            or default_url
-        )
     elif provider == "local":
-        default_url = existing.get("UPSTREAM_BASE_URL") or WIZARD_UPSTREAM_URLS["local"]
-        upstream_url = (
-            input_fn(f"Local engine base URL [{default_url}]: ").strip() or default_url
-        )
+        candidate_existing = existing.get("UPSTREAM_BASE_URL", "")
+        if any(h in candidate_existing for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1")):
+            default_url = candidate_existing
+        elif "local_jev" in services and "ollama" not in services:
+            default_url = "http://127.0.0.1:11435/v1"
+        else:
+            default_url = "http://127.0.0.1:11434/v1"
+        typed = input_fn(f"Local engine base URL [{default_url}]: ").strip()
+        upstream_url = typed or default_url
     else:
         upstream_url = WIZARD_UPSTREAM_URLS[provider]
 
