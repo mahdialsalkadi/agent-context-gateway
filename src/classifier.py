@@ -323,15 +323,28 @@ async def route_tools_via_jev(
         ],
     }
 
-    headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
-    if cfg.classifier_api_key:
-        headers["Authorization"] = f"Bearer {cfg.classifier_api_key}"
-
-    target_url = cfg.classifier_api_url
-    if not target_url and getattr(cfg, "local_jev_url", None):
-        target_url = cfg.local_jev_url
+    target_url = (
+        getattr(cfg, "classifier_api_url", "")
+        or getattr(cfg, "jev_api_base_url", "")
+        or getattr(cfg, "local_jev_url", "")
+        or DEFAULT_LOCAL_JEV_URL
+    )
     if not target_url or not target_url.startswith(("http://", "https://")):
         target_url = DEFAULT_LOCAL_JEV_URL
+
+    target_url = target_url.rstrip("/")
+    if not target_url.endswith("/chat/completions"):
+        target_url = f"{target_url}/chat/completions"
+
+    headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
+    api_key = (
+        getattr(cfg, "classifier_api_key", "")
+        or getattr(cfg, "jev_api_key", "")
+        or os.environ.get("JEV_API_KEY", "")
+        or os.environ.get("CLASSIFIER_API_KEY", "")
+    )
+    if api_key and api_key != "local":
+        headers["Authorization"] = f"Bearer {api_key}"
 
     budget = float(getattr(cfg, "local_jev_timeout", None) or LOCAL_JEV_TIMEOUT_SECONDS)
     timeout = max(5.0, budget * 3)

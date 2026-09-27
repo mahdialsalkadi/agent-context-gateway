@@ -954,10 +954,20 @@ RUN_AGENTS = {
         },
         "args": [],
     },
+    "antigravity": {
+        "binary": "agy",
+        "env": {
+            "OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1",
+            "OPENAI_API_KEY": "dummy",
+        },
+        "args": [],
+    },
 }
 
 
-def build_agent_env(agent: str, port: int, api_key: str = "dummy") -> dict:
+def build_agent_env(
+    agent: str, port: int, api_key: str = "dummy", model: Optional[str] = None
+) -> dict:
     """Environment variables to inject for `run`. Pure and testable."""
     spec = RUN_AGENTS.get(agent)
     if not spec:
@@ -968,6 +978,12 @@ def build_agent_env(agent: str, port: int, api_key: str = "dummy") -> dict:
             res[key] = api_key
         else:
             res[key] = value.format(port=port)
+    if agent == "hermes":
+        m = model or os.environ.get("HERMES_MODEL") or os.environ.get("MODEL_NAME")
+        if m:
+            res["MODEL_NAME"] = m
+            res["HERMES_MODEL"] = m
+            res["OPENAI_MODEL"] = m
     return res
 
 
@@ -1025,11 +1041,24 @@ def resolve_agent_path(agent: str) -> Optional[str]:
         except Exception:
             pass
 
+    if binary in ("agy", "antigravity") or agent == "antigravity":
+        for alt in ("agy", "antigravity"):
+            found = shutil.which(alt)
+            if found:
+                return found
+            for cand in (home / ".local" / "bin" / alt, Path("/usr/local/bin") / alt):
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    return str(cand)
+
     return None
 
 
 def build_agent_command(
-    agent: str, extra_args: List[str], port: int, binary_path: Optional[str] = None
+    agent: str,
+    extra_args: List[str],
+    port: int,
+    binary_path: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> List[str]:
     """Full argv for the child agent, with gateway flags inserted. Pure."""
     spec = RUN_AGENTS.get(agent)
@@ -1038,6 +1067,10 @@ def build_agent_command(
     bin_name = binary_path or spec["binary"]
     command = [bin_name]
     command.extend(arg.format(port=port) for arg in spec["args"])
+    if agent == "hermes":
+        m = model or os.environ.get("HERMES_MODEL") or os.environ.get("MODEL_NAME")
+        if m and not any(arg in ("-m", "--model") for arg in extra_args):
+            command.extend(["-m", m])
     command.extend(extra_args)
     return command
 
@@ -1069,6 +1102,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             hints = [
                 "Install it via 'npm install -g @anthropic-ai/claude-code'",
                 "Or use the native skill mode: 'agent-gateway install-skill claude'",
+                "Or start in standalone gateway mode: 'agent-gateway start --daemon'",
+            ]
+        elif agent == "antigravity":
+            error_msg = (
+                "[Error] 'agy' / 'antigravity' CLI was not found or is not installed on PATH. "
+                "Use the native skill mode: 'agent-gateway install-skill antigravity'."
+            )
+            hints = [
+                "Use native skill mode: 'agent-gateway install-skill antigravity'",
                 "Or start in standalone gateway mode: 'agent-gateway start --daemon'",
             ]
         else:
@@ -1115,12 +1157,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     )
 
+    model = (
+        getattr(args, "model", None)
+        or os.environ.get("HERMES_MODEL")
+        or getattr(settings, "hermes_model", "")
+        or None
+    )
     agent_key = settings.upstream_api_key or "dummy"
-    agent_env = build_agent_env(agent, settings.port, agent_key)
+    agent_env = build_agent_env(agent, settings.port, agent_key, model=model)
     environment = os.environ.copy()
     environment.update(agent_env)
 
-    command = build_agent_command(agent, args.agent_args, settings.port, binary_path=binary_path)
+    command = build_agent_command(
+        agent, args.agent_args, settings.port, binary_path=binary_path, model=model
+    )
     sys.stderr.write(
         ux.dim("[run] env: " + ", ".join(sorted(agent_env)) + "\n", stream=sys.stderr)
     )
@@ -1310,7 +1360,8 @@ WIZARD_AGENTS = (
     ("1", "hermes", "Hermes Agent"),
     ("2", "claude", "Claude Code"),
     ("3", "codex", "Codex"),
-    ("4", "standalone", "Standalone Gateway (run in background only)"),
+    ("4", "antigravity", "Google Antigravity"),
+    ("5", "standalone", "Standalone Gateway (run in background only)"),
 )
 
 WIZARD_HERMES_UPSTREAMS = (
@@ -1351,34 +1402,34 @@ WIZARD_STANDALONE_UPSTREAMS = (
 
 WIZARD_UPSTREAMS = WIZARD_HERMES_UPSTREAMS
 
-# Step 3: consolidated 2 clear, practical choices (advanced available via --advanced flag)
+# Step 3: consolidated 3 clear, practical choices (advanced available via --advanced flag)
 WIZARD_ENGINES = (
     (
         "1",
         "local_jev",
-        "Local Jev-2B Decision (Vulkan GPU accelerated, ~20ms, smart semantic router) [Default]",
+        "Local Jev-2B Decision (Vulkan GPU accelerated, offline $0) [Default]",
     ),
     (
         "2",
+        "external_jev",
+        "Cloud / API Jev Decision (via OpenRouter / dedicated Jev endpoint)",
+    ),
+    (
+        "3",
         "heuristics",
-        "Fast Regex Heuristics (<1ms, rule-based, zero model overhead)",
+        "Fast Regex Heuristics (<1ms, rule-based)",
     ),
 )
 WIZARD_ADVANCED_ENGINES = (
     (
-        "3",
+        "4",
         "upstream_reused",
         "Upstream Reused        (asks the provider you already chose to classify)",
     ),
     (
-        "4",
+        "5",
         "local_ollama",
         "Local Ollama classifier (qwen2.5:0.5b / llama3.2)",
-    ),
-    (
-        "5",
-        "external_jev",
-        "External JEV endpoint  (dedicated classifier URL + key, e.g. OpenRouter)",
     ),
 )
 WIZARD_STRATEGIES = WIZARD_ENGINES + WIZARD_ADVANCED_ENGINES
@@ -1509,6 +1560,9 @@ def build_wizard_preset(
     classifier_url: Optional[str] = None,
     classifier_key: Optional[str] = None,
     anthropic_surface: Optional[bool] = None,
+    hermes_model: Optional[str] = None,
+    jev_api_base_url: Optional[str] = None,
+    jev_api_key: Optional[str] = None,
 ) -> dict:
     """The `.env` values the launcher should apply. Pure and testable.
 
@@ -1545,11 +1599,28 @@ def build_wizard_preset(
         preset["LOCAL_JEV_URL"] = existing.get(
             "LOCAL_JEV_URL", "http://127.0.0.1:11435/v1/chat/completions"
         )
+    if hermes_model:
+        preset["HERMES_MODEL"] = hermes_model
+    elif agent == "hermes" and existing.get("HERMES_MODEL"):
+        preset["HERMES_MODEL"] = existing["HERMES_MODEL"]
+
+    if jev_api_base_url:
+        preset["JEV_API_BASE_URL"] = jev_api_base_url
+        preset["CLASSIFIER_API_URL"] = jev_api_base_url
+    if jev_api_key:
+        preset["JEV_API_KEY"] = jev_api_key
+        preset["CLASSIFIER_API_KEY"] = jev_api_key
+
     if classifier_url:
-        preset["CLASSIFIER_API_URL"] = classifier_url
+        if "CLASSIFIER_API_URL" not in preset:
+            preset["CLASSIFIER_API_URL"] = classifier_url
+        if strategy == "external_jev" and "JEV_API_BASE_URL" not in preset:
+            preset["JEV_API_BASE_URL"] = classifier_url
         resolved = classifier_key or existing.get("CLASSIFIER_API_KEY")
-        if resolved:
+        if resolved and "CLASSIFIER_API_KEY" not in preset:
             preset["CLASSIFIER_API_KEY"] = resolved
+        if strategy == "external_jev" and resolved and "JEV_API_KEY" not in preset:
+            preset["JEV_API_KEY"] = resolved
     if agent == "claude" or anthropic_surface:
         preset["ANTHROPIC_SURFACE"] = "1"
     return preset
@@ -1640,6 +1711,12 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     env_path = Path.cwd() / ".env"
     existing = read_env_file(env_path)
 
+    hermes_model = ""
+    if agent == "hermes":
+        default_model = existing.get("HERMES_MODEL") or "hermes-3-llama-3.1-8b"
+        prompt_model = f"Enter model name [{default_model}]: "
+        hermes_model = input_fn(prompt_model).strip() or default_model
+
     # --- step 2: contextual upstream ----------------------------------------
     sys.stderr.write(
         ux.dim(
@@ -1650,7 +1727,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     )
     if agent == "hermes":
         upstream_options = WIZARD_HERMES_UPSTREAMS
-    elif agent in ("claude", "codex"):
+    elif agent in ("claude", "codex", "antigravity"):
         upstream_options = WIZARD_SUBSCRIPTION_AGENT_UPSTREAMS
     elif agent == "standalone":
         upstream_options = WIZARD_STANDALONE_UPSTREAMS
@@ -1744,13 +1821,13 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         sys.stderr.write(f"  [{number}] {label}\n")
 
     default_strategy_num = "1"
-    if existing.get("CLASSIFIER_MODE") == "heuristics":
+    if existing.get("CLASSIFIER_MODE") == "external_jev":
         default_strategy_num = "2"
+    elif existing.get("CLASSIFIER_MODE") == "heuristics":
+        default_strategy_num = "3"
     elif existing.get("CLASSIFIER_MODE") == "upstream_reused":
-        default_strategy_num = "3" if is_advanced else "1"
-    elif existing.get("CLASSIFIER_MODE") == "local_ollama":
         default_strategy_num = "4" if is_advanced else "1"
-    elif existing.get("CLASSIFIER_MODE") == "external_jev":
+    elif existing.get("CLASSIFIER_MODE") == "local_ollama":
         default_strategy_num = "5" if is_advanced else "1"
 
     max_choice = len(engines_to_show)
@@ -1770,17 +1847,26 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     # `external_jev` is the one strategy that needs its own classifier endpoint.
     classifier_url = ""
     classifier_key = ""
+    jev_api_base_url = ""
+    jev_api_key = ""
     if strategy == "external_jev":
-        default_classifier = existing.get("CLASSIFIER_API_URL", "")
-        shown = default_classifier or f"{upstream_url}/chat/completions"
-        classifier_url = (
-            input_fn(f"Classifier endpoint URL [{shown}]: ").strip()
-            or default_classifier
-            or f"{upstream_url.rstrip('/')}/chat/completions"
+        default_jev_url = (
+            existing.get("JEV_API_BASE_URL")
+            or existing.get("CLASSIFIER_API_URL")
+            or "https://openrouter.ai/api/v1"
         )
-        classifier_key = input_fn(
-            "Classifier API key (blank keeps the existing key): "
-        ).strip()
+        jev_url_input = (
+            input_fn(f"Jev API base URL [{default_jev_url}]: ").strip()
+            or default_jev_url
+        )
+        jev_api_base_url = jev_url_input
+        classifier_url = jev_url_input
+
+        existing_jev_key = existing.get("JEV_API_KEY") or existing.get("CLASSIFIER_API_KEY", "")
+        hint = " (blank keeps the existing key)" if existing_jev_key else ""
+        jev_key_input = input_fn(f"Jev API key{hint}: ").strip()
+        jev_api_key = jev_key_input or existing_jev_key
+        classifier_key = jev_api_key
 
     # --- the port is not a question -----------------------------------------
     # Silent by default: 8090 when free, 8091 when 8080/8090 are busy, and only
@@ -1802,6 +1888,9 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         classifier_url=classifier_url,
         classifier_key=classifier_key,
         anthropic_surface=anthropic_surface,
+        hermes_model=hermes_model,
+        jev_api_base_url=jev_api_base_url,
+        jev_api_key=jev_api_key,
     )
     update_env_file(env_path, preset)
     os.environ.update({key: str(value) for key, value in preset.items()})
@@ -1865,7 +1954,13 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         ux.dim(f"[launcher] starting {agent} through :{settings.port}\n", stream=sys.stderr)
     )
     return cmd_run(
-        argparse.Namespace(agent=agent, agent_args=[], input_fn=input_fn, interactive=True)
+        argparse.Namespace(
+            agent=agent,
+            agent_args=[],
+            input_fn=input_fn,
+            interactive=True,
+            model=hermes_model or existing.get("HERMES_MODEL"),
+        )
     )
 
 
@@ -1900,14 +1995,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     skill = subparsers.add_parser(
         "install-skill",
-        help="generate and install native Jev tool router skill for subscriptions (claude, codex, generic)",
+        help="generate and install native Jev tool router skill for subscriptions (claude, codex, antigravity, generic)",
     )
     skill.add_argument(
         "target",
         nargs="?",
         default="claude",
-        choices=["claude", "codex", "generic"],
-        help="subscription target environment (claude | codex | generic, default: claude)",
+        choices=["claude", "codex", "antigravity", "generic"],
+        help="subscription target environment (claude | codex | antigravity | generic, default: claude)",
     )
     skill.add_argument("--dest", help="custom destination directory")
     skill.add_argument("--test", action="store_true", help="verify local Jev connectivity")
@@ -1957,7 +2052,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser(
         "run", help="start the gateway (if needed) and launch an agent through it"
     )
-    run.add_argument("agent", help="claude | hermes | aider | cursor")
+    run.add_argument("agent", help="claude | hermes | aider | cursor | codex | antigravity")
+    run.add_argument("-m", "--model", help="target model name for the agent (e.g. hermes)")
     run.add_argument(
         "agent_args", nargs="*", help="extra arguments passed to the agent"
     )

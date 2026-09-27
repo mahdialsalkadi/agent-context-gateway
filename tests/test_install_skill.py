@@ -77,3 +77,36 @@ def test_cli_install_skill_command(tmp_path, monkeypatch, capsys):
     assert "[Skill Installed]" in captured.out
     assert "[Skill Ready]" in captured.out
     assert (dest / "jev-router.py").is_file()
+
+
+def test_install_skill_antigravity(tmp_path, monkeypatch):
+    dest = tmp_path / "antigravity_skills"
+    script_path, doc_path = install_skill(target="antigravity", dest_dir=dest)
+
+    assert script_path.is_file()
+    assert doc_path.is_file()
+    assert os.access(script_path, os.X_OK)
+
+    script_content = script_path.read_text(encoding="utf-8")
+    assert "--api-key" in script_content
+    assert "JEV_API_BASE_URL" in script_content
+    assert "Authorization" in script_content
+
+    # Check default antigravity dir
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    gemini_dir = tmp_path / ".gemini" / "antigravity-cli"
+    gemini_dir.mkdir(parents=True, exist_ok=True)
+    default_dir = get_default_skill_dir("antigravity")
+    assert str(default_dir).endswith(".gemini/antigravity-cli/skills")
+
+
+def test_cli_install_skill_antigravity(tmp_path, capsys):
+    dest = tmp_path / "custom_agy_skills"
+    parser = build_parser()
+    args = parser.parse_args(["install-skill", "antigravity", "--dest", str(dest)])
+
+    ret = cmd_install_skill(args)
+    assert ret == 0
+    assert (dest / "jev-router.py").is_file()
+    assert (dest / "jev-router" / "SKILL.md").is_file()
+    assert (dest / "jev-router" / "jev-router.py").is_file()

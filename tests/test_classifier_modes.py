@@ -761,3 +761,49 @@ async def test_local_jev_uses_the_configured_timeout(monkeypatch):
 
     assert await classifier.needs_tools("run the test suite") is True
     assert seen["timeout"] == 1.5
+
+
+async def test_cloud_api_jev_routing_dispatches_with_bearer_and_normalized_url():
+    from src.classifier import route_tools_via_jev
+
+    captured_requests = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(["tool_a"])}}
+                ]
+            },
+        )
+
+    settings = load_settings(
+        env={
+            "CLASSIFIER_MODE": "external_jev",
+            "JEV_API_BASE_URL": "https://openrouter.ai/api/v1",
+            "JEV_API_KEY": "sk-or-cloud-secret",
+        }
+    )
+
+    tools = [
+        {"type": "function", "function": {"name": "tool_a", "description": "tool A"}},
+        {"type": "function", "function": {"name": "tool_b", "description": "tool B"}},
+    ]
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        routed = await route_tools_via_jev(
+            prompt="use tool a",
+            tools=tools,
+            client=client,
+            settings=settings,
+        )
+
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert str(req.url) == "https://openrouter.ai/api/v1/chat/completions"
+    assert req.headers.get("authorization") == "Bearer sk-or-cloud-secret"
+    assert len(routed) == 1
+    assert routed[0]["function"]["name"] == "tool_a"

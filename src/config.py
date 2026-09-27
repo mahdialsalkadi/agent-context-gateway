@@ -339,6 +339,10 @@ class Settings:
     # those names, this replaces the model on the Anthropic surface only.
     anthropic_model_override: str = ""
 
+    hermes_model: str = ""
+    jev_api_base_url: str = ""
+    jev_api_key: str = ""
+
     memory_injection: bool = True
     memory_inject_tool_turns: bool = False
 
@@ -509,7 +513,7 @@ def load_settings(
     )
 
     classifier_url = sanitize_url(
-        _first(env, ("CLASSIFIER_API_URL", "JEV_API_URL"), "")
+        _first(env, ("CLASSIFIER_API_URL", "JEV_API_BASE_URL", "JEV_API_URL"), "")
     )
     classifier_key = resolve_indirect_key(
         _first(env, ("CLASSIFIER_API_KEY", "JEV_API_KEY"), ""),
@@ -565,10 +569,19 @@ def load_settings(
         )
         classifier_protocol = DEFAULT_CLASSIFIER_PROTOCOL
     elif resolved_mode == CLASSIFIER_MODE_EXTERNAL_JEV:
-        # Unchanged: a dedicated endpoint, and `blueprint` remains available.
-        pass
+        classifier_url = sanitize_url(
+            _first(env, ("JEV_API_BASE_URL", "CLASSIFIER_API_URL", "JEV_API_URL"), "")
+        )
+        classifier_key = resolve_indirect_key(
+            _first(env, ("JEV_API_KEY", "CLASSIFIER_API_KEY"), ""),
+            _first(env, ("JEV_API_KEY_ENV", "CLASSIFIER_API_KEY_ENV"), ""),
+            env,
+        )
 
     extra_regex = _first(env, ("REASONING_MODEL_REGEX",), "")
+    hermes_model = _first(env, ("HERMES_MODEL", "MODEL_NAME", "OPENAI_MODEL"), "")
+    jev_api_base_url = sanitize_url(_first(env, ("JEV_API_BASE_URL",), ""))
+    jev_api_key = _first(env, ("JEV_API_KEY",), "")
 
     return Settings(
         host=_first(env, ("GATEWAY_HOST", "HERMES_PROXY_HOST"), DEFAULT_HOST),
@@ -637,5 +650,8 @@ def load_settings(
         extra_reasoning_patterns=tuple(
             part.strip() for part in extra_regex.split(",") if part.strip()
         ),
+        hermes_model=hermes_model,
+        jev_api_base_url=jev_api_base_url,
+        jev_api_key=jev_api_key,
         env_file=discovered,
     )

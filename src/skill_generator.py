@@ -12,13 +12,17 @@ from pathlib import Path
 import sys
 from typing import Optional
 
-DEFAULT_JEV_URL = "http://127.0.0.1:11435/v1/chat/completions"
+DEFAULT_JEV_URL = os.environ.get(
+    "JEV_API_BASE_URL",
+    os.environ.get("JEV_URL", "http://127.0.0.1:11435/v1/chat/completions"),
+)
 
 SKILL_SCRIPT_TEMPLATE = '''#!/usr/bin/env python3
 """Jev Semantic Tool Router - Native Skill for Subscriptions.
 
 Zero-proxy, zero-network-interception tool pruning.
-Directly queries the local Vulkan-accelerated Jev model at http://127.0.0.1:11435.
+Directly queries the local Vulkan-accelerated Jev model at http://127.0.0.1:11435
+or configured cloud Jev endpoint.
 """
 
 import argparse
@@ -30,7 +34,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Set
 
-DEFAULT_JEV_URL = os.environ.get("JEV_URL", "http://127.0.0.1:11435/v1/chat/completions")
+DEFAULT_JEV_URL = os.environ.get(
+    "JEV_API_BASE_URL",
+    os.environ.get("JEV_URL", "http://127.0.0.1:11435/v1/chat/completions"),
+)
+DEFAULT_JEV_API_KEY = os.environ.get("JEV_API_KEY", "")
 ROUTER_SYSTEM_PROMPT = (
     "You are a semantic tool router. Given candidate tools and user request/context, "
     "select ONLY the tool names strictly required to fulfill this turn.\\n"
@@ -93,6 +101,7 @@ def route_tools(
     prompt: str,
     tools: List[Any],
     jev_url: str = DEFAULT_JEV_URL,
+    api_key: Optional[str] = None,
     context: Optional[str] = None,
     timeout: float = 5.0,
 ) -> List[str]:
@@ -132,10 +141,19 @@ def route_tools(
         ],
     }
 
+    target_url = jev_url.rstrip("/")
+    if not target_url.endswith("/chat/completions"):
+        target_url = f"{target_url}/chat/completions"
+
+    headers = {"Content-Type": "application/json", "Accept-Encoding": "identity"}
+    resolved_key = api_key if api_key is not None else DEFAULT_JEV_API_KEY
+    if resolved_key and resolved_key != "local":
+        headers["Authorization"] = f"Bearer {resolved_key}"
+
     req = urllib.request.Request(
-        jev_url,
+        target_url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+        headers=headers,
         method="POST",
     )
 
@@ -154,18 +172,28 @@ def route_tools(
     return list(candidate_names)
 
 
-def ping_jev(jev_url: str = DEFAULT_JEV_URL, timeout: float = 2.0) -> bool:
-    """Check whether local Jev llama-server is healthy."""
-    base = jev_url.rsplit("/v1/", 1)[0] + "/health" if "/v1/" in jev_url else jev_url
-    req = urllib.request.Request(base, method="GET")
+def ping_jev(
+    jev_url: str = DEFAULT_JEV_URL,
+    api_key: Optional[str] = None,
+    timeout: float = 2.0,
+) -> bool:
+    """Check whether Jev llama-server or API endpoint is healthy."""
+    target = jev_url.rstrip("/")
+    base = target.rsplit("/v1/", 1)[0] + "/health" if "/v1/" in target else target
+    headers = {}
+    resolved_key = api_key if api_key is not None else DEFAULT_JEV_API_KEY
+    if resolved_key and resolved_key != "local":
+        headers["Authorization"] = f"Bearer {resolved_key}"
+    req = urllib.request.Request(base, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status in (200, 404)  # 404 means server is up but no /health
     except Exception:
         # Fallback to GET /v1/models
         try:
-            models_url = jev_url.rsplit("/chat/completions", 1)[0] + "/models"
-            with urllib.request.urlopen(urllib.request.Request(models_url), timeout=timeout) as resp:
+            models_url = target.rsplit("/chat/completions", 1)[0] + "/models" if "/chat/completions" in target else f"{target}/models"
+            req2 = urllib.request.Request(models_url, headers=headers, method="GET")
+            with urllib.request.urlopen(req2, timeout=timeout) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -177,17 +205,18 @@ def main() -> int:
     parser.add_argument("--tools", "-t", help="Candidate tools as JSON string or file path")
     parser.add_argument("--context", "-c", help="Optional conversation execution context")
     parser.add_argument("--jev-url", default=DEFAULT_JEV_URL, help="Jev endpoint URL")
-    parser.add_argument("--test", "--ping", action="store_true", help="Ping local Jev server")
+    parser.add_argument("--api-key", "-k", default=DEFAULT_JEV_API_KEY, help="Jev API key (optional)")
+    parser.add_argument("--test", "--ping", action="store_true", help="Ping Jev server")
 
     args = parser.parse_args()
 
     if args.test:
-        alive = ping_jev(args.jev_url)
+        alive = ping_jev(args.jev_url, api_key=args.api_key)
         if alive:
-            sys.stdout.write(f"[jev-router] Local Jev server is ACTIVE at {args.jev_url}\\n")
+            sys.stdout.write(f"[jev-router] Jev server is ACTIVE at {args.jev_url}\\n")
             return 0
         else:
-            sys.stderr.write(f"[jev-router] Local Jev server is UNREACHABLE at {args.jev_url}\\n")
+            sys.stderr.write(f"[jev-router] Jev server is UNREACHABLE at {args.jev_url}\\n")
             return 1
 
     prompt = args.prompt or ""
@@ -217,7 +246,13 @@ def main() -> int:
     if not isinstance(raw_tools, list):
         raw_tools = []
 
-    selected = route_tools(prompt=prompt, tools=raw_tools, jev_url=args.jev_url, context=args.context)
+    selected = route_tools(
+        prompt=prompt,
+        tools=raw_tools,
+        jev_url=args.jev_url,
+        api_key=args.api_key,
+        context=args.context,
+    )
     sys.stdout.write(json.dumps(selected, indent=2) + "\\n")
     return 0
 
@@ -261,6 +296,11 @@ def get_default_skill_dir(target: str = "claude") -> Path:
         return Path.home() / ".claude" / "skills"
     elif target_clean in ("codex", "openai-codex"):
         return Path.home() / ".codex" / "skills"
+    elif target_clean in ("antigravity", "google-antigravity", "agy"):
+        gemini_dir = Path.home() / ".gemini" / "antigravity-cli" / "skills"
+        if gemini_dir.parent.exists():
+            return gemini_dir
+        return Path.home() / ".antigravity" / "skills"
     else:
         return Path.home() / ".agent-gateway" / "skills"
 
@@ -284,21 +324,32 @@ def install_skill(
     skill_sub_dir.mkdir(parents=True, exist_ok=True)
     doc_path = skill_sub_dir / "SKILL.md"
     doc_path.write_text(SKILL_MARKDOWN_TEMPLATE, encoding="utf-8")
+    (skill_sub_dir / "jev-router.py").write_text(SKILL_SCRIPT_TEMPLATE, encoding="utf-8")
+    (skill_sub_dir / "jev-router.py").chmod(0o755)
     return script_path, doc_path
 
 
-def ping_jev(jev_url: str = DEFAULT_JEV_URL, timeout: float = 2.0) -> bool:
-    """Check whether local Jev llama-server is healthy."""
+def ping_jev(
+    jev_url: str = DEFAULT_JEV_URL,
+    api_key: Optional[str] = None,
+    timeout: float = 2.0,
+) -> bool:
+    """Check whether local Jev llama-server or API endpoint is healthy."""
     import urllib.request
-    base = jev_url.rsplit("/v1/", 1)[0] + "/health" if "/v1/" in jev_url else jev_url
-    req = urllib.request.Request(base, method="GET")
+    target = jev_url.rstrip("/")
+    base = target.rsplit("/v1/", 1)[0] + "/health" if "/v1/" in target else target
+    headers = {}
+    if api_key and api_key != "local":
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(base, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status in (200, 404)
     except Exception:
         try:
-            models_url = jev_url.rsplit("/chat/completions", 1)[0] + "/models"
-            with urllib.request.urlopen(urllib.request.Request(models_url), timeout=timeout) as resp:
+            models_url = target.rsplit("/chat/completions", 1)[0] + "/models" if "/chat/completions" in target else f"{target}/models"
+            req2 = urllib.request.Request(models_url, headers=headers, method="GET")
+            with urllib.request.urlopen(req2, timeout=timeout) as resp:
                 return resp.status == 200
         except Exception:
             return False
