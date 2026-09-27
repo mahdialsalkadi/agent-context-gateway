@@ -1711,12 +1711,6 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     env_path = Path.cwd() / ".env"
     existing = read_env_file(env_path)
 
-    hermes_model = ""
-    if agent == "hermes":
-        default_model = existing.get("HERMES_MODEL") or "hermes-3-llama-3.1-8b"
-        prompt_model = f"Enter model name [{default_model}]: "
-        hermes_model = input_fn(prompt_model).strip() or default_model
-
     # --- step 2: contextual upstream ----------------------------------------
     sys.stderr.write(
         ux.dim(
@@ -1749,8 +1743,30 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         from .config import load_settings
         from .jev_lifecycle import ensure_local_jev_running
 
+        # ── Step 3 for native skill: choose routing engine ──────────
+        sys.stderr.write(
+            ux.dim(
+                "\n── Step 3 · Routing & Pruning Engine ─────────────────",
+                stream=sys.stderr,
+            )
+            + "\n"
+        )
+        is_advanced = getattr(args, "advanced", False)
+        engines_to_show = WIZARD_STRATEGIES if is_advanced else WIZARD_ENGINES
+        for number, _key, label in engines_to_show:
+            sys.stderr.write(f"  [{number}] {label}\n")
+        max_choice = len(engines_to_show)
+        skill_strategy = ""
+        while not skill_strategy:
+            raw = input_fn(f"Select 1-{max_choice} [1]: ").strip() or "1"
+            for number, key, _l in WIZARD_STRATEGIES:
+                if raw == number:
+                    skill_strategy = key
+                    break
+
         settings = load_settings()
-        ensure_local_jev_running(settings)
+        if skill_strategy == "local_jev":
+            ensure_local_jev_running(settings)
         script_path, doc_path = install_skill(target=agent)
         sys.stderr.write(
             ux.green(f"\n✔ Native Jev tool router skill installed\n", stream=sys.stderr)
@@ -1888,7 +1904,6 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         classifier_url=classifier_url,
         classifier_key=classifier_key,
         anthropic_surface=anthropic_surface,
-        hermes_model=hermes_model,
         jev_api_base_url=jev_api_base_url,
         jev_api_key=jev_api_key,
     )
@@ -1959,7 +1974,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
             agent_args=[],
             input_fn=input_fn,
             interactive=True,
-            model=hermes_model or existing.get("HERMES_MODEL"),
+            model=existing.get("HERMES_MODEL"),
         )
     )
 

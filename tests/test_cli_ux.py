@@ -583,7 +583,7 @@ def test_cmd_interactive_is_three_steps_with_a_status_banner(
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["1", "", "1", "", "3"])  # Hermes, default model, Local, default URL, heuristics
+    answers = iter(["1", "1", "", "3"])  # Hermes, Local, default URL, heuristics
     args.input_fn = lambda p: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -595,7 +595,6 @@ def test_cmd_interactive_is_three_steps_with_a_status_banner(
     assert "Vulkan GPU accelerated" in err
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CLASSIFIER_MODE=heuristics" in text
-    assert "HERMES_MODEL=hermes-3-llama-3.1-8b" in text
 
 
 def test_cmd_interactive_silently_picks_8091_when_8080_is_busy(
@@ -611,7 +610,7 @@ def test_cmd_interactive_silently_picks_8091_when_8080_is_busy(
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
     prompts = []
-    answers = iter(["1", "", "1", "", "3"])  # Hermes, default model, Local, default URL, heuristics
+    answers = iter(["1", "1", "", "3"])  # Hermes, Local, default URL, heuristics
     args.input_fn = lambda p: (prompts.append(p), next(answers))[1]
 
     assert cmd_interactive(args) == 0
@@ -630,7 +629,7 @@ def test_cmd_interactive_port_flag_overrides_silently(tmp_path, monkeypatch):
     args = cli.build_parser().parse_args(
         ["interactive", "--no-launch", "--port", "8123"]
     )
-    answers = iter(["1", "", "1", "", "3"])  # Hermes, default model, Local, default URL, heuristics
+    answers = iter(["1", "1", "", "3"])  # Hermes, Local, default URL, heuristics
     args.input_fn = lambda _p: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -651,7 +650,7 @@ def test_cmd_interactive_repairs_a_missing_global_shim(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "install_global_wrapper", fake_install)
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["1", "", "1", "", "3"])
+    answers = iter(["1", "1", "", "3"])
     args.input_fn = lambda _p: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -705,8 +704,8 @@ def test_cmd_interactive_claude_selects_native_skill(tmp_path, monkeypatch, caps
     monkeypatch.setattr("src.jev_lifecycle.ensure_local_jev_running", lambda settings: True)
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Claude Code (2), Native Skill Mode (1)
-    answers = iter(["2", "1"])
+    # Claude Code (2), Native Skill Mode (1), local_jev engine (1)
+    answers = iter(["2", "1", "1"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
@@ -742,13 +741,12 @@ def test_cmd_interactive_external_jev_prompts_for_the_classifier_endpoint(
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch", "--advanced"])
-    # Hermes, model, Local engine, base URL, external JEV engine (2), dedicated URL and key.
-    answers = iter(["1", "custom-hermes-model", "1", "", "2", "https://jev.example/v1", "jev-key"])
+    # Hermes, Local engine, base URL, external JEV engine (2), dedicated URL and key.
+    answers = iter(["1", "1", "", "2", "https://jev.example/v1", "jev-key"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
     text = (tmp_path / ".env").read_text(encoding="utf-8")
-    assert "HERMES_MODEL=custom-hermes-model" in text
     assert "CLASSIFIER_API_URL=https://jev.example/v1" in text
     assert "CLASSIFIER_API_KEY=jev-key" in text
 
@@ -761,8 +759,8 @@ def test_cmd_interactive_local_engine_never_prompts_for_a_key(tmp_path, monkeypa
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
     prompts = []
-    # Hermes, model (""), local engine (1), its base URL, heuristics engine (3).
-    answers = iter(["1", "", "1", "", "3"])
+    # Hermes, local engine (1), its base URL, heuristics engine (3).
+    answers = iter(["1", "1", "", "3"])
 
     def fake_input(prompt):
         prompts.append(prompt)
@@ -854,22 +852,20 @@ def test_cmd_interactive_hermes_local_vs_external_api(tmp_path, monkeypatch):
 
     # 1. Hermes selecting Local (1)
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["1", "", "1", "", "1"])
+    answers = iter(["1", "1", "", "1"])
     args.input_fn = lambda _prompt: next(answers)
     assert cmd_interactive(args) == 0
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1" in text
-    assert "HERMES_MODEL=hermes-3-llama-3.1-8b" in text
 
     # 2. Hermes selecting External API (2) -> OpenRouter (1)
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    answers = iter(["1", "custom-hermes", "2", "1", "sk-or-test", "1"])
+    answers = iter(["1", "2", "1", "sk-or-test", "1"])
     args.input_fn = lambda _prompt: next(answers)
     assert cmd_interactive(args) == 0
     text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "UPSTREAM_BASE_URL=https://openrouter.ai/api/v1" in text
     assert "UPSTREAM_API_KEY=sk-or-test" in text
-    assert "HERMES_MODEL=custom-hermes" in text
 
 
 def test_agent_gateway_stop_signals_shutdown_and_releases_ports(monkeypatch, capsys):
@@ -931,14 +927,15 @@ def test_cmd_interactive_antigravity_selects_native_skill(tmp_path, monkeypatch,
     monkeypatch.setattr("src.jev_lifecycle.ensure_local_jev_running", lambda settings: True)
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Antigravity (4), Native Skill Mode (1)
-    answers = iter(["4", "1"])
+    # Antigravity (4), Native Skill Mode (1), local_jev engine (1)
+    answers = iter(["4", "1", "1"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
     assert installed.get("target") == "antigravity"
     err = capsys.readouterr().err
     assert "Native Jev tool router skill installed" in err
+    assert "Step 3 · Routing & Pruning Engine" in err
 
 
 def test_cmd_interactive_cloud_jev_selection(tmp_path, monkeypatch):
@@ -948,8 +945,8 @@ def test_cmd_interactive_cloud_jev_selection(tmp_path, monkeypatch):
     )
 
     args = cli.build_parser().parse_args(["interactive", "--no-launch"])
-    # Hermes (1), model (""), Local engine (1), base URL (""), Cloud Jev (2), Jev API URL, Jev API key
-    answers = iter(["1", "", "1", "", "2", "https://openrouter.ai/api/v1", "sk-or-cloud-jev"])
+    # Hermes (1), Local engine (1), base URL (""), Cloud Jev (2), Jev API URL, Jev API key
+    answers = iter(["1", "1", "", "2", "https://openrouter.ai/api/v1", "sk-or-cloud-jev"])
     args.input_fn = lambda _prompt: next(answers)
 
     assert cmd_interactive(args) == 0
