@@ -165,6 +165,9 @@ def test_status_reports_a_healthy_gateway(monkeypatch, capsys):
     assert payload["classifier_mode"] == "upstream_reused"
     assert payload["profile"] == "antigravity"
     assert payload["foreign_service_on_port"] is False
+    assert "jev_server" in payload
+    assert "port" in payload["jev_server"]
+    assert "installed_skills" in payload
 
 
 # ------------------------------------------------------------------------------

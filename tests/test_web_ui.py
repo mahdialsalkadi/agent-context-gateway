@@ -213,3 +213,40 @@ def test_html_contains_static_fallbacks():
     assert "recent requests" in DASHBOARD_HTML
     assert "knowledge graph" in DASHBOARD_HTML
     assert "estimated" in DASHBOARD_HTML.lower() or "dollars" in DASHBOARD_HTML.lower()
+
+
+def test_ui_html_has_no_profile_or_switch_controls():
+    """The dashboard HTML must be permanently purged of legacy profile and switcher buttons."""
+    lower_html = DASHBOARD_HTML.lower()
+    assert "profile" not in lower_html, "DASHBOARD_HTML must not contain legacy profile container"
+    assert "switch" not in lower_html, "DASHBOARD_HTML must not contain legacy switch buttons"
+    assert "pruned tools count" in lower_html
+    assert "rate-limit quota saved" in lower_html
+
+
+def test_stats_payload_includes_mode_and_pruned_tools_count(tmp_path):
+    from src.analytics import Analytics
+
+    log = tmp_path / "audit.log"
+    log.write_text(
+        json.dumps({
+            "timestamp": "2026-09-28T07:00:00Z",
+            "agent": "antigravity",
+            "route": "Jev-Skill",
+            "tools_in": 5,
+            "tools_out": 2,
+            "selected_tools": ["t1", "t2"],
+            "latency_ms": 15.0,
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    data = stats_payload(Analytics(log))
+    assert data["mode"] == "Native Skill"
+    assert data["pruned_tools_count"] == 3
+    assert len(data["recent"]) == 1
+    assert data["recent"][0]["agent"] == "antigravity"
+    assert data["recent"][0]["route"] == "Jev-Skill"
+    assert data["recent"][0]["selected_tools"] == ["t1", "t2"]
+

@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import json
 from pathlib import Path
 import pytest
 
@@ -110,3 +111,62 @@ def test_cli_install_skill_antigravity(tmp_path, capsys):
     assert (dest / "jev-router.py").is_file()
     assert (dest / "jev-router" / "SKILL.md").is_file()
     assert (dest / "jev-router" / "jev-router.py").is_file()
+
+
+def test_antigravity_skill_descriptor_and_telemetry(tmp_path, monkeypatch):
+    dest = tmp_path / "antigravity_test"
+    audit_file = tmp_path / "logs" / "audit.log"
+    script_path, doc_path = install_skill(target="antigravity", dest_dir=dest)
+
+    # 1. Descriptor check
+    doc_text = doc_path.read_text(encoding="utf-8")
+    assert "Before executing actions or selecting tools from the catalog" in doc_text
+    assert "run the jev-router skill to determine the exact minimal tool subset" in doc_text
+    assert "name: jev-router" in doc_text
+
+    # 2. Execution and telemetry check
+    import subprocess
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            "--prompt", "list git files",
+            "--tools", json.dumps([{"name": "git_ls", "description": "list files"}, {"name": "browser", "description": "web"}]),
+            "--audit-file", str(audit_file),
+            "--agent", "antigravity",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    assert audit_file.is_file()
+    lines = audit_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 1
+    record = json.loads(lines[-1])
+    assert record["agent"] == "antigravity"
+    assert record["route"] == "Jev-Skill"
+    assert record["tools_in"] == 2
+    assert "tools_out" in record
+    assert "selected_tools" in record
+    assert "latency_ms" in record
+    assert "timestamp" in record
+
+
+def test_antigravity_dual_installation(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(Path, "cwd", lambda: tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".gemini" / "antigravity-cli").mkdir(parents=True, exist_ok=True)
+
+    script_path, doc_path = install_skill(target="antigravity")
+
+    # Global CLI
+    assert (tmp_path / ".gemini" / "antigravity-cli" / "skills" / "jev-router" / "SKILL.md").is_file()
+    # Global Config
+    assert (tmp_path / ".gemini" / "config" / "skills" / "jev-router" / "SKILL.md").is_file()
+    # Workspace Gemini
+    assert (tmp_path / "workspace" / ".gemini" / "skills" / "jev-router" / "SKILL.md").is_file()
+    # Workspace Agents Rule
+    rule = tmp_path / "workspace" / ".agents" / "rules" / "jev-router.md"
+    assert rule.is_file()
+    assert "run the jev-router skill" in rule.read_text(encoding="utf-8")

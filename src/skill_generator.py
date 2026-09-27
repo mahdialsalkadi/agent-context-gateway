@@ -1,8 +1,9 @@
 """Native Jev tool router skill generator for subscription environments.
 
 Generates standalone, zero-dependency skill scripts that run inside
-Claude Code, Codex, or generic environments, directly querying the local
-Vulkan-accelerated Jev model at http://127.0.0.1:11435/v1/chat/completions.
+Claude Code, Codex, Antigravity, or generic environments, directly querying
+the local Vulkan-accelerated Jev model at http://127.0.0.1:11435/v1/chat/completions.
+Records routing telemetry directly to ~/.agent-gateway/logs/audit.log.
 """
 
 from __future__ import annotations
@@ -23,13 +24,17 @@ SKILL_SCRIPT_TEMPLATE = '''#!/usr/bin/env python3
 Zero-proxy, zero-network-interception tool pruning.
 Directly queries the local Vulkan-accelerated Jev model at http://127.0.0.1:11435
 or configured cloud Jev endpoint.
+Emits telemetry to ~/.agent-gateway/logs/audit.log.
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Set
@@ -39,6 +44,11 @@ DEFAULT_JEV_URL = os.environ.get(
     os.environ.get("JEV_URL", "http://127.0.0.1:11435/v1/chat/completions"),
 )
 DEFAULT_JEV_API_KEY = os.environ.get("JEV_API_KEY", "")
+DEFAULT_AUDIT_LOG = os.environ.get(
+    "AGENT_GATEWAY_AUDIT_LOG",
+    str(Path.home() / ".agent-gateway" / "logs" / "audit.log"),
+)
+DEFAULT_AGENT = "{target_agent}"
 ROUTER_SYSTEM_PROMPT = (
     "You are a semantic tool router. Given candidate tools and user request/context, "
     "select ONLY the tool names strictly required to fulfill this turn.\\n"
@@ -97,16 +107,61 @@ def parse_jev_output(text: str, candidate_names: Set[str]) -> List[str]:
     return result
 
 
+def log_audit(
+    agent: str,
+    route: str,
+    tools_in: int,
+    tools_out: int,
+    selected_tools: List[str],
+    latency_ms: float,
+    audit_file: Optional[str] = None,
+) -> None:
+    """Append structured telemetry record to gateway audit log."""
+    try:
+        target_path = Path(audit_file) if audit_file else Path(DEFAULT_AUDIT_LOG)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        now_utc = datetime.now(timezone.utc)
+        record = {
+            "timestamp": now_utc.isoformat(),
+            "agent": agent,
+            "route": route,
+            "tools_in": tools_in,
+            "tools_out": tools_out,
+            "selected_tools": selected_tools,
+            "latency_ms": latency_ms,
+            "ts": now_utc.timestamp(),
+            "tools_before": tools_in,
+            "tools_after": tools_out,
+        }
+        with open(target_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\\n")
+    except Exception:
+        pass
+
+
 def route_tools(
     prompt: str,
     tools: List[Any],
     jev_url: str = DEFAULT_JEV_URL,
     api_key: Optional[str] = None,
     context: Optional[str] = None,
+    agent: str = DEFAULT_AGENT,
+    audit_file: Optional[str] = None,
     timeout: float = 5.0,
 ) -> List[str]:
     """Prune candidate tools to only the minimal subset required for the prompt."""
+    start_time = time.perf_counter()
     if not tools:
+        if prompt:
+            log_audit(
+                agent=agent,
+                route="Jev-Skill",
+                tools_in=0,
+                tools_out=0,
+                selected_tools=[],
+                latency_ms=0.0,
+                audit_file=audit_file,
+            )
         return []
 
     candidate_names: Set[str] = set()
@@ -157,6 +212,7 @@ def route_tools(
         method="POST",
     )
 
+    selected: List[str] = []
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             if response.status == 200:
@@ -164,12 +220,24 @@ def route_tools(
                 choices = data.get("choices", [])
                 if choices:
                     content = choices[0].get("message", {}).get("content", "")
-                    return parse_jev_output(content, candidate_names)
+                    selected = parse_jev_output(content, candidate_names)
+            else:
+                selected = list(candidate_names)
     except Exception as exc:
         sys.stderr.write(f"[jev-router] Warning: routing via Jev failed ({exc}); retaining all tools.\\n")
-        return list(candidate_names)
+        selected = list(candidate_names)
 
-    return list(candidate_names)
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    log_audit(
+        agent=agent,
+        route="Jev-Skill",
+        tools_in=len(candidate_names),
+        tools_out=len(selected),
+        selected_tools=selected,
+        latency_ms=latency_ms,
+        audit_file=audit_file,
+    )
+    return selected
 
 
 def ping_jev(
@@ -204,6 +272,8 @@ def main() -> int:
     parser.add_argument("--prompt", "-p", help="User request or instruction")
     parser.add_argument("--tools", "-t", help="Candidate tools as JSON string or file path")
     parser.add_argument("--context", "-c", help="Optional conversation execution context")
+    parser.add_argument("--agent", default=DEFAULT_AGENT, help="Agent identity for telemetry")
+    parser.add_argument("--audit-file", default=None, help="Custom audit log path")
     parser.add_argument("--jev-url", default=DEFAULT_JEV_URL, help="Jev endpoint URL")
     parser.add_argument("--api-key", "-k", default=DEFAULT_JEV_API_KEY, help="Jev API key (optional)")
     parser.add_argument("--test", "--ping", action="store_true", help="Ping Jev server")
@@ -252,6 +322,8 @@ def main() -> int:
         jev_url=args.jev_url,
         api_key=args.api_key,
         context=args.context,
+        agent=args.agent,
+        audit_file=args.audit_file,
     )
     sys.stdout.write(json.dumps(selected, indent=2) + "\\n")
     return 0
@@ -263,27 +335,48 @@ if __name__ == "__main__":
 
 SKILL_MARKDOWN_TEMPLATE = """---
 name: jev-router
-description: "Semantic tool router powered by local Vulkan-accelerated Jev-2B. Prunes tool candidates to minimal required subset for 0$ token spend."
+description: Semantic tool router powered by local Vulkan-accelerated Jev-2B. Prunes tool candidates to minimal required subset for 0$ token spend. Before executing actions or selecting tools from the catalog, run the jev-router skill to determine the exact minimal tool subset required for the user's turn.
 version: 1.0.0
+metadata:
+  icon: router
 ---
 
 # Jev Semantic Tool Router
 
-Prunes large tool schemas down to the exact subset needed for the current prompt using your local Vulkan-accelerated Jev model.
+Before executing actions or selecting tools from the catalog, run the jev-router skill to determine the exact minimal tool subset required for the user's turn.
 
-## Advantages for Subscriptions (Claude Code, Codex)
+## Description
+Evaluates the user's request against available candidate tools and returns ONLY the minimal required subset as a JSON array, saving 100% of pruned schema overhead with $0 token spend via local Vulkan-accelerated Jev.
+
+## When to Use
+- **Before selecting tools**: Always execute before making actions or picking tools from the catalog to keep token usage lean.
 - **Zero API costs**: Evaluated 100% offline via local `llama-server` on Vulkan GPU (`http://127.0.0.1:11435`).
-- **Zero Network Interception**: Does not proxy or break official subscription auth.
-- **Context Preservation**: Keeps token usage lean and reduces hallucinated tool calls.
+- **Telemetry**: Automatically records routing decisions to gateway telemetry (`~/.agent-gateway/logs/audit.log`).
 
-## Usage
+## Input Parameters
+- `--prompt` (`string`, required): The user's prompt or task instruction for the turn.
+- `--tools` (`string` or `JSON array`, required): List of tool definitions or tool names available to the agent.
+- `--context` (`string`, optional): Recent conversation context or task history.
+- `--jev-url` (`string`, optional): Endpoint for Jev (default: `http://127.0.0.1:11435/v1/chat/completions`).
+- `--agent` (`string`, optional): Agent name for telemetry (default: `{agent}`).
 
-### Direct CLI
+## Output Format
+JSON array containing the filtered list of tool names to keep:
+```json
+["tool_a", "tool_b"]
+```
+If no tools are required (e.g. conversational questions, explanations), returns `[]`.
+
+## Execution Schema
 ```bash
-python3 jev-router.py --prompt "check git diff of repo" --tools '[{"name": "git_diff", "description": "view changes"}, {"name": "browser", "description": "web browser"}]'
+python3 jev-router.py --prompt "<user_prompt>" --tools '[{"name": "...", "description": "..."}]'
+```
+Or pipe via stdin:
+```bash
+echo '{"prompt": "check git diff", "tools": [{"name": "run_command"}]}' | python3 jev-router.py
 ```
 
-### Self-Test
+## Self-Test
 ```bash
 python3 jev-router.py --test
 ```
@@ -308,24 +401,96 @@ def get_default_skill_dir(target: str = "claude") -> Path:
 def install_skill(
     target: str = "claude",
     dest_dir: Optional[Path] = None,
+    workspace: bool = False,
 ) -> tuple[Path, Path]:
     """Generate and write the native Jev tool router skill.
 
-    Returns (script_path, doc_path).
+    Supports dual installation for Antigravity (global + workspace).
+    Returns (script_path, doc_path) of the primary installation.
     """
-    base_dir = Path(dest_dir) if dest_dir else get_default_skill_dir(target)
+    target_clean = target.lower().strip()
+    agent_id = "antigravity" if target_clean in ("antigravity", "google-antigravity", "agy") else target_clean
+    script_content = SKILL_SCRIPT_TEMPLATE.replace("{target_agent}", agent_id)
+    doc_content = SKILL_MARKDOWN_TEMPLATE.replace("{agent}", agent_id)
+
+    if dest_dir is not None:
+        base_dir = Path(dest_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
+        script_path = base_dir / "jev-router.py"
+        script_path.write_text(script_content, encoding="utf-8")
+        script_path.chmod(0o755)
+
+        skill_sub_dir = base_dir / "jev-router"
+        skill_sub_dir.mkdir(parents=True, exist_ok=True)
+        doc_path = skill_sub_dir / "SKILL.md"
+        doc_path.write_text(doc_content, encoding="utf-8")
+        sub_script = skill_sub_dir / "jev-router.py"
+        sub_script.write_text(script_content, encoding="utf-8")
+        sub_script.chmod(0o755)
+        return script_path, doc_path
+
+    # Production installation path (dest_dir is None)
+    base_dir = get_default_skill_dir(target)
     base_dir.mkdir(parents=True, exist_ok=True)
 
     script_path = base_dir / "jev-router.py"
-    script_path.write_text(SKILL_SCRIPT_TEMPLATE, encoding="utf-8")
+    script_path.write_text(script_content, encoding="utf-8")
     script_path.chmod(0o755)
 
     skill_sub_dir = base_dir / "jev-router"
     skill_sub_dir.mkdir(parents=True, exist_ok=True)
     doc_path = skill_sub_dir / "SKILL.md"
-    doc_path.write_text(SKILL_MARKDOWN_TEMPLATE, encoding="utf-8")
-    (skill_sub_dir / "jev-router.py").write_text(SKILL_SCRIPT_TEMPLATE, encoding="utf-8")
-    (skill_sub_dir / "jev-router.py").chmod(0o755)
+    doc_path.write_text(doc_content, encoding="utf-8")
+    sub_script = skill_sub_dir / "jev-router.py"
+    sub_script.write_text(script_content, encoding="utf-8")
+    sub_script.chmod(0o755)
+
+    # For Antigravity: complete dual installation across global and workspace
+    if target_clean in ("antigravity", "google-antigravity", "agy"):
+        # 1. Additional global location: ~/.gemini/config/skills/jev-router/
+        config_skill_dir = Path.home() / ".gemini" / "config" / "skills" / "jev-router"
+        try:
+            config_skill_dir.mkdir(parents=True, exist_ok=True)
+            (config_skill_dir / "SKILL.md").write_text(doc_content, encoding="utf-8")
+            s = config_skill_dir / "jev-router.py"
+            s.write_text(script_content, encoding="utf-8")
+            s.chmod(0o755)
+        except OSError:
+            pass
+
+        # 2. Workspace locations (if in a workspace / repository or workspace=True)
+        cwd = Path.cwd()
+        ws_candidates = [
+            cwd / ".gemini" / "skills" / "jev-router",
+            cwd / ".agents" / "skills" / "jev-router",
+        ]
+        for ws_dir in ws_candidates:
+            try:
+                ws_dir.mkdir(parents=True, exist_ok=True)
+                (ws_dir / "SKILL.md").write_text(doc_content, encoding="utf-8")
+                ws_script = ws_dir / "jev-router.py"
+                ws_script.write_text(script_content, encoding="utf-8")
+                ws_script.chmod(0o755)
+            except OSError:
+                pass
+
+        # 3. Workspace rule trigger: .agents/rules/jev-router.md
+        rules_dir = cwd / ".agents" / "rules"
+        try:
+            rules_dir.mkdir(parents=True, exist_ok=True)
+            rule_file = rules_dir / "jev-router.md"
+            rule_text = (
+                "---\n"
+                "trigger: always_on\n"
+                "---\n\n"
+                "# Jev Semantic Tool Router Instruction\n\n"
+                "Before executing actions or selecting tools from the catalog, run the jev-router "
+                "skill to determine the exact minimal tool subset required for the user's turn.\n"
+            )
+            rule_file.write_text(rule_text, encoding="utf-8")
+        except OSError:
+            pass
+
     return script_path, doc_path
 
 
@@ -353,4 +518,3 @@ def ping_jev(
                 return resp.status == 200
         except Exception:
             return False
-

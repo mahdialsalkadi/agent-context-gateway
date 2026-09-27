@@ -55,3 +55,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# --- Local workspace customizations ---
+.agents/
+.gemini/

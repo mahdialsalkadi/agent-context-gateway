@@ -1,13 +1,9 @@
-"""
-Embedded web dashboard: one HTML page, three JSON endpoints, zero build step.
+"""Embedded web dashboard: one HTML page, three JSON endpoints, zero build step.
 
 The page is a Python string served by FastAPI at GET /ui. Vanilla JS only --
 the only remote reference is the Tailwind CDN script, which the page degrades
 gracefully without. All dynamic data comes from /ui/api/* endpoints on this
 same origin, so the dashboard works on a loopback port with no CORS setup.
-
-The analytics figures are the same estimates `agent-gateway stats` shows; the
-UI exists to make them visible, not to pretend they are exact.
 """
 
 from __future__ import annotations
@@ -43,35 +39,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <header class="flex items-center justify-between">
     <div>
       <h1 class="text-xl font-bold">agent-context-gateway</h1>
-      <p id="sub" class="text-sm text-slate-400">loading…</p>
+      <p id="sub" class="text-sm text-slate-400">Context Telemetry & Semantic Pruning</p>
     </div>
     <div class="flex items-center gap-2">
-      <div id="tier" class="badge pass">tier…</div>
+      <div id="mode" class="badge pass">Transparent Proxy</div>
       <div id="conn" class="badge keep">connecting…</div>
     </div>
   </header>
 
   <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
-    <div class="card p-4"><div class="text-xs text-slate-400">rate-limit quota saved</div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400">rate-limit quota saved</div>
       <div id="quota" class="num text-2xl font-bold mt-1 text-amber-300">–</div>
-      <div id="usd" class="num text-xs text-emerald-400 mt-1">–</div></div>
-    <div class="card p-4"><div class="text-xs text-slate-400">tokens saved</div>
-      <div id="tokens" class="num text-2xl font-bold mt-1">–</div></div>
-    <div class="card p-4"><div class="text-xs text-slate-400">requests</div>
-      <div id="requests" class="num text-2xl font-bold mt-1">–</div></div>
-    <div class="card p-4"><div class="text-xs text-slate-400">p50 / p90 latency</div>
-      <div id="latency" class="num text-2xl font-bold mt-1">–</div></div>
-  </section>
-
-  <section class="card p-4">
-    <div class="flex items-center justify-between mb-3">
-      <h2 class="font-semibold">profile</h2>
-      <span id="profile-note" class="text-xs text-slate-500">switching restarts nothing; state is shared</span>
+      <div id="usd" class="num text-xs text-emerald-400 mt-1">–</div>
     </div>
-    <div id="profiles" class="flex flex-wrap gap-2">
-      <span class="text-sm text-slate-500">loading…</span>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400">pruned tools count</div>
+      <div id="pruned-tools" class="num text-2xl font-bold mt-1 text-emerald-400">–</div>
+      <div id="pruned-sub" class="num text-xs text-slate-400 mt-1">–</div>
     </div>
-    <p id="profile-msg" class="text-xs mt-2 text-slate-400"></p>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400">requests</div>
+      <div id="requests" class="num text-2xl font-bold mt-1">–</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400">p50 / p90 latency</div>
+      <div id="latency" class="num text-2xl font-bold mt-1">–</div>
+    </div>
   </section>
 
   <section class="card p-4">
@@ -82,9 +76,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="overflow-x-auto">
     <table class="w-full text-sm">
       <thead><tr class="text-left text-xs text-slate-500 border-b border-slate-800">
-        <th class="py-1 pr-3">time</th><th class="py-1 pr-3">route</th>
-        <th class="py-1 pr-3">tools</th><th class="py-1 pr-3">latency</th></tr></thead>
-      <tbody id="feed"><tr><td colspan="4" class="py-3 text-slate-500">no requests yet</td></tr></tbody>
+        <th class="py-1 pr-3">timestamp</th>
+        <th class="py-1 pr-3">agent</th>
+        <th class="py-1 pr-3">route</th>
+        <th class="py-1 pr-3">selected tools</th>
+        <th class="py-1 pr-3">latency</th></tr></thead>
+      <tbody id="feed"><tr><td colspan="5" class="py-3 text-slate-500">no requests yet</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -114,7 +111,7 @@ const $ = (id) => document.getElementById(id);
 const badgeClass = (route) =>
   route.includes("Strip") ? "badge strip"
   : route.includes("Passthrough") ? "badge pass"
-  : (route.includes("Selective") || route.includes("Jev-Routed")) ? "badge sel"
+  : (route.includes("Selective") || route.includes("Jev-Routed") || route.includes("Skill")) ? "badge sel"
   : "badge keep";
 
 function badgeFor(route) {
@@ -133,75 +130,49 @@ async function jget(url) {
 async function refreshStats() {
   const d = await jget("/ui/api/stats");
   $("quota").textContent = (d.quota_preserved_pct || 0).toFixed(1) + "%";
-  $("usd").textContent = (d.tools_forwarded || 0) + " of " + (d.tools_offered || 0) +
-    " tools forwarded · ~$" + d.estimated_usd_saved.toFixed(4) + " on a metered plan";
-  $("tokens").textContent = d.estimated_tokens_saved.toLocaleString();
-  $("requests").textContent = d.requests.toLocaleString();
-  $("latency").textContent = d.latency_ms.p50.toFixed(0) + " / " + d.latency_ms.p90.toFixed(0) + "ms";
-  $("sub").textContent = "benchmark $" + d.benchmark_usd_per_mtoken.toFixed(2) + "/M prompt tokens";
+  $("usd").textContent = "~$" + (d.estimated_usd_saved || 0).toFixed(4) + " saved on metered plan";
+  $("pruned-tools").textContent = (d.pruned_tools_count || 0).toLocaleString();
+  $("pruned-sub").textContent = (d.estimated_tokens_saved || 0).toLocaleString() + " tokens saved";
+  $("requests").textContent = (d.requests || 0).toLocaleString();
+  $("latency").textContent = ((d.latency_ms && d.latency_ms.p50) ? d.latency_ms.p50.toFixed(0) : "0") + " / " +
+    ((d.latency_ms && d.latency_ms.p90) ? d.latency_ms.p90.toFixed(0) : "0") + "ms";
 
-  const tier = d.connection || {};
-  $("tier").textContent = tier.label || "unknown tier";
-  $("tier").className = "badge " +
-    (tier.tier === "subscription" ? "strip" : tier.tier === "local" ? "sel" : "pass");
+  const mode = d.mode || (d.recent && d.recent.some(r => r.route.includes("Skill")) ? "Native Skill" : "Transparent Proxy");
+  $("mode").textContent = mode;
+  $("mode").className = "badge " + (mode.includes("Skill") ? "sel" : "pass");
 
   const feed = $("feed");
   feed.textContent = "";
-  if (!d.recent.length) {
-    feed.innerHTML = '<tr><td colspan="4" class="py-3 text-slate-500">no requests yet</td></tr>';
-  }
-  for (const row of d.recent) {
-    const tr = document.createElement("tr");
-    tr.className = "border-b border-slate-900";
-    const time = document.createElement("td");
-    time.className = "py-1 pr-3 text-slate-400 num";
-    time.textContent = row.time;
-    const route = document.createElement("td");
-    route.className = "py-1 pr-3";
-    route.appendChild(badgeFor(row.route));
-    const tools = document.createElement("td");
-    tools.className = "py-1 pr-3 num";
-    tools.textContent = row.tools;
-    const lat = document.createElement("td");
-    lat.className = "py-1 pr-3 num";
-    lat.textContent = row.latency;
-    tr.append(time, route, tools, lat);
-    feed.appendChild(tr);
-  }
-}
+  if (!d.recent || !d.recent.length) {
+    feed.innerHTML = '<tr><td colspan="5" class="py-3 text-slate-500">no requests yet</td></tr>';
+  } else {
+    for (const row of d.recent) {
+      const tr = document.createElement("tr");
+      tr.className = "border-b border-slate-900";
 
-async function refreshProfile() {
-  const d = await jget("/ui/api/profile");
-  const wrap = $("profiles");
-  wrap.textContent = "";
-  const current = document.createElement("span");
-  current.className = "badge keep";
-  current.textContent = "active: " + d.active;
-  wrap.appendChild(current);
-  for (const p of d.available) {
-    if (p === d.active) continue;
-    const btn = document.createElement("button");
-    btn.className = "badge pass hover:opacity-80";
-    btn.textContent = "switch → " + p;
-    btn.onclick = () => switchProfile(p);
-    wrap.appendChild(btn);
-  }
-}
+      const time = document.createElement("td");
+      time.className = "py-1 pr-3 text-slate-400 num";
+      time.textContent = row.time;
 
-async function switchProfile(name) {
-  $("profile-msg").textContent = "switching to " + name + " …";
-  try {
-    const r = await fetch("/ui/api/profile", {
-      method: "POST",
-      headers: {"content-type": "application/json"},
-      body: JSON.stringify({profile: name}),
-    });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || r.status);
-    $("profile-msg").textContent = d.message || ("now on " + name);
-    refreshProfile();
-  } catch (e) {
-    $("profile-msg").textContent = "switch failed: " + e.message;
+      const agent = document.createElement("td");
+      agent.className = "py-1 pr-3 font-medium text-slate-300";
+      agent.textContent = row.agent || "–";
+
+      const route = document.createElement("td");
+      route.className = "py-1 pr-3";
+      route.appendChild(badgeFor(row.route));
+
+      const tools = document.createElement("td");
+      tools.className = "py-1 pr-3 num text-slate-300";
+      tools.textContent = row.tools;
+
+      const lat = document.createElement("td");
+      lat.className = "py-1 pr-3 num text-slate-400";
+      lat.textContent = row.latency;
+
+      tr.append(time, agent, route, tools, lat);
+      feed.appendChild(tr);
+    }
   }
 }
 
@@ -253,7 +224,7 @@ let failures = 0;
 async function tick() {
   document.body.classList.add("refreshing");
   try {
-    await Promise.all([refreshStats(), refreshProfile(), refreshGraph()]);
+    await Promise.all([refreshStats(), refreshGraph()]);
     failures = 0;
     $("conn").textContent = "live";
     $("conn").className = "badge keep";
@@ -282,8 +253,24 @@ def dashboard_response() -> HTMLResponse:
 def stats_payload(analytics, recent_limit: int = 20, connection=None) -> Dict[str, Any]:
     """Analytics numbers plus the recent-request feed, UI-shaped."""
     data = analytics.compute().as_dict()
-    data["recent"] = recent_requests(analytics, recent_limit)
+    recent = recent_requests(analytics, recent_limit)
+    data["recent"] = recent
     data["connection"] = connection or {}
+
+    tools_offered = data.get("tools_offered") or 0
+    tools_forwarded = data.get("tools_forwarded") or 0
+    data["pruned_tools_count"] = max(0, tools_offered - tools_forwarded)
+
+    # Determine mode: Native Skill vs Transparent Proxy
+    if any("Skill" in str(r.get("route", "")) for r in recent):
+        data["mode"] = "Native Skill"
+    else:
+        tier = (connection or {}).get("tier")
+        if tier == "subscription":
+            data["mode"] = "Native Skill"
+        else:
+            data["mode"] = "Transparent Proxy"
+
     return data
 
 
@@ -301,24 +288,40 @@ def recent_requests(analytics, limit: int = 20) -> list:
     feed = []
     for entry in rows:
         ts = entry.get("ts") or 0
-        before = entry.get("tools_before")
-        after = entry.get("tools_after")
-        selected_tools = entry.get("selected_tools")
-        if isinstance(before, int) and isinstance(after, int) and after:
-            if selected_tools and isinstance(selected_tools, list):
-                tools = f"{before} → {after} [{', '.join(selected_tools)}]"
-            else:
-                tools = f"{before} → {after}"
-        elif isinstance(before, int):
-            tools = f"{before} → 0"
+        raw_ts = entry.get("timestamp")
+        if raw_ts:
+            time_display = raw_ts.split("T")[-1][:8] if "T" in str(raw_ts) else str(raw_ts)
+        elif ts:
+            time_display = _time.strftime("%H:%M:%S", _time.localtime(ts))
         else:
-            tools = "–"
+            time_display = "–"
+
+        agent = str(entry.get("agent") or entry.get("surface") or "–")
+        route = str(entry.get("route") or "unknown")
+
+        before = entry.get("tools_in") if "tools_in" in entry else entry.get("tools_before")
+        after = entry.get("tools_out") if "tools_out" in entry else entry.get("tools_after")
+        selected_tools = entry.get("selected_tools") or []
+
+        if selected_tools and isinstance(selected_tools, list):
+            tools_str = f"[{', '.join(selected_tools)}]"
+            if isinstance(before, int) and isinstance(after, int):
+                tools_str = f"{before} → {after} {tools_str}"
+        elif isinstance(before, int) and isinstance(after, int):
+            tools_str = f"{before} → {after}"
+        elif isinstance(before, int):
+            tools_str = f"{before} → 0"
+        else:
+            tools_str = "–"
+
         latency = entry.get("latency_ms")
         feed.append(
             {
-                "time": _time.strftime("%H:%M:%S", _time.localtime(ts)) if ts else "–",
-                "route": str(entry.get("route") or "unknown"),
-                "tools": tools,
+                "time": time_display,
+                "agent": agent,
+                "route": route,
+                "tools": tools_str,
+                "selected_tools": selected_tools if isinstance(selected_tools, list) else [],
                 "latency": f"{latency:.0f}ms" if isinstance(latency, (int, float)) else "–",
             }
         )

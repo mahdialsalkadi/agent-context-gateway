@@ -284,6 +284,100 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_jev_diagnostic(url: str = "http://127.0.0.1:11435") -> dict:
+    import urllib.request
+    from urllib.parse import urlparse
+
+    online = False
+    model_name = None
+    try:
+        parsed = urlparse(url)
+        base = f"{parsed.scheme or 'http'}://{parsed.netloc or '127.0.0.1:11435'}"
+        req = urllib.request.Request(
+            f"{base}/v1/models",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            if resp.status == 200:
+                online = True
+                data = json.loads(resp.read().decode("utf-8"))
+                models = data.get("models") or data.get("data") or []
+                if models and isinstance(models, list):
+                    first = models[0]
+                    model_name = first.get("name") or first.get("id") or "qwen3.5-2b"
+                    if isinstance(model_name, str) and "/" in model_name:
+                        model_name = Path(model_name).name
+    except Exception:
+        pass
+
+    jev_pid = None
+    vulkan_resident = False
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "llama-server.*11435"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        pids = [int(p) for p in out.stdout.split() if p.isdigit()]
+        if not pids:
+            out2 = subprocess.run(
+                ["pgrep", "llama-server"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            pids = [int(p) for p in out2.stdout.split() if p.isdigit()]
+        if pids:
+            jev_pid = pids[0]
+            maps_path = Path(f"/proc/{jev_pid}/maps")
+            if maps_path.is_file():
+                maps_content = maps_path.read_text(errors="ignore").lower()
+                if any(k in maps_content for k in ("vulkan", "radv", "nvidia", "amdgpu")):
+                    vulkan_resident = True
+            cmd_path = Path(f"/proc/{jev_pid}/cmdline")
+            if cmd_path.is_file():
+                cmd_content = cmd_path.read_text(errors="ignore")
+                if "-ngl" in cmd_content:
+                    vulkan_resident = True
+    except Exception:
+        pass
+
+    return {
+        "port": 11435,
+        "online": online,
+        "model": model_name,
+        "pid": jev_pid,
+        "vulkan_gpu_resident": vulkan_resident,
+    }
+
+
+def _detect_installed_skills() -> list:
+    candidates = [
+        ("antigravity_cli", Path.home() / ".gemini" / "antigravity-cli" / "skills" / "jev-router"),
+        ("antigravity_config", Path.home() / ".gemini" / "config" / "skills" / "jev-router"),
+        ("claude", Path.home() / ".claude" / "skills"),
+        ("codex", Path.home() / ".codex" / "skills"),
+        ("workspace_gemini", Path.cwd() / ".gemini" / "skills" / "jev-router"),
+        ("workspace_agents", Path.cwd() / ".agents" / "skills" / "jev-router"),
+    ]
+    detected = []
+    seen = set()
+    for name, p in candidates:
+        if p.exists() and str(p) not in seen:
+            seen.add(str(p))
+            py_file = p / "jev-router.py" if p.is_dir() else p
+            md_file = p / "SKILL.md" if p.is_dir() else None
+            detected.append({
+                "target": name,
+                "path": str(p),
+                "script_exists": py_file.is_file(),
+                "script_executable": os.access(py_file, os.X_OK) if py_file.is_file() else False,
+                "manifest_exists": md_file.is_file() if md_file else False,
+            })
+    return detected
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from .config import load_settings
 
@@ -291,8 +385,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     pid = _read_pid()
     alive = _pid_alive(pid)
     health = _probe_health()
+    jev_diag = _probe_jev_diagnostic(settings.local_jev_url)
+    skills = _detect_installed_skills()
 
     payload = {
+        "gateway": {
+            "pid": pid,
+            "pid_alive": alive,
+            "listen": f"{settings.host}:{settings.port}",
+            "healthy": bool(health),
+            "version": (health or {}).get("version"),
+            "upstream": (health or {}).get("upstream"),
+            "classifier_mode": (health or {}).get("classifier_mode"),
+        },
+        "jev_server": jev_diag,
+        "installed_skills": skills,
         "pid": pid,
         "pid_alive": alive,
         "pid_recorded_by_cli": pid is not None,
@@ -2020,10 +2127,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="subscription target environment (claude | codex | antigravity | generic, default: claude)",
     )
     skill.add_argument("--dest", help="custom destination directory")
+    skill.add_argument("--workspace", action="store_true", help="install to current workspace in addition to global")
     skill.add_argument("--test", action="store_true", help="verify local Jev connectivity")
     skill.set_defaults(func=cmd_install_skill)
 
     stop = subparsers.add_parser("stop", help="stop a gateway started by this CLI")
+    stop.add_argument("--keep-jev", action="store_true", help="keep local Jev server running in VRAM")
     stop.set_defaults(func=cmd_stop)
 
     status = subparsers.add_parser("status", help="pid, health and configuration summary")

@@ -228,6 +228,14 @@ class Analytics:
                 stats.latencies_ms.append(float(latency))
 
             timestamp = entry.get("ts")
+            if timestamp is None and entry.get("timestamp"):
+                try:
+                    from datetime import datetime
+                    ts_str = str(entry["timestamp"])
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    timestamp = int(dt.timestamp())
+                except Exception:
+                    timestamp = None
             if isinstance(timestamp, (int, float)):
                 timestamp = int(timestamp)
                 stats.first_ts = (
@@ -252,9 +260,9 @@ class Analytics:
         # sends the kept subset (the saving is the dropped count). `tools_before`
         # is recorded by the gateway after the synthetic fetch_log was appended,
         # which is exactly what would have been sent without the gateway.
-        tools_before = entry.get("tools_before")
-        tools_after = entry.get("tools_after")
-        if tools_before is None and route in PRUNED_ROUTES:
+        tools_before = entry.get("tools_before") if "tools_before" in entry else entry.get("tools_in")
+        tools_after = entry.get("tools_after") if "tools_after" in entry else entry.get("tools_out")
+        if tools_before is None and (route in PRUNED_ROUTES or route == "Jev-Skill"):
             # Audit rows from before the tool counters existed. Estimate from
             # the action alone, using the observed-average schema size.
             tools_before, tools_after = 10, 0
@@ -264,7 +272,10 @@ class Analytics:
                 savings.schema_tokens += int(
                     dropped * (TOOL_SCHEMA_OVERHEAD_TOKENS + 2 * TOKENS_PER_TOOL_PROPERTY)
                 )
-            savings.selective_drops += int(entry.get("selective_dropped") or 0)
+            sel_drop = entry.get("selective_dropped")
+            if sel_drop is None:
+                sel_drop = dropped
+            savings.selective_drops += int(sel_drop)
             savings.tools_before_total += max(0, int(tools_before))
             savings.tools_after_total += max(0, int(tools_after))
 
