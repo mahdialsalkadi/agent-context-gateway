@@ -1064,6 +1064,18 @@ RUN_AGENTS = {
     "antigravity": {
         "binary": "agy",
         "env": {
+            "HTTP_PROXY": "http://127.0.0.1:{port}",
+            "HTTPS_PROXY": "http://127.0.0.1:{port}",
+            "ALL_PROXY": "http://127.0.0.1:{port}",
+            "http_proxy": "http://127.0.0.1:{port}",
+            "https_proxy": "http://127.0.0.1:{port}",
+            "all_proxy": "http://127.0.0.1:{port}",
+            "GOOGLE_API_ENDPOINT": "http://127.0.0.1:{port}",
+            "CLOUDCODE_BASE_URL": "http://127.0.0.1:{port}",
+            "GEMINI_BASE_URL": "http://127.0.0.1:{port}/v1",
+            "ANTIGRAVITY_ENDPOINT": "http://127.0.0.1:{port}",
+            "ANTIGRAVITY_PROXY": "http://127.0.0.1:{port}",
+            "DAILY_CLOUDCODE_ENDPOINT": "http://127.0.0.1:{port}",
             "OPENAI_BASE_URL": "http://127.0.0.1:{port}/v1",
             "OPENAI_API_KEY": "dummy",
         },

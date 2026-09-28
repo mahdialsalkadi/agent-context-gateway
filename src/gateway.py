@@ -1034,6 +1034,337 @@ def create_app(
         )
 
     # ----------------------------------------------------------------------
+    # Google CloudCode / Gemini / Antigravity endpoints
+    # ----------------------------------------------------------------------
+    def google_upstream_url(action: str = "") -> str:
+        base = (
+            os.environ.get("GOOGLE_API_ENDPOINT")
+            or os.environ.get("CLOUDCODE_BASE_URL")
+            or (
+                cfg().upstream_base_url
+                if ("daily-cloudcode" in cfg().upstream_base_url or "googleapis" in cfg().upstream_base_url)
+                else "https://daily-cloudcode-pa.googleapis.com"
+            )
+        ).rstrip("/")
+        if action:
+            action = action.lstrip("/")
+            return f"{base}/{action}"
+        return base
+
+    def google_forward_headers(request: Request) -> Dict[str, str]:
+        headers = {}
+        for k, v in request.headers.items():
+            if k.lower() in ("host", "content-length", "transfer-encoding"):
+                continue
+            headers[k] = v
+        headers["accept-encoding"] = "identity"
+        auth = upstream_auth_header(
+            cfg().upstream_api_key, client_upstream_auth(request, cfg().gateway_api_key)
+        )
+        if auth and "authorization" not in headers:
+            headers["authorization"] = auth
+        return headers
+
+    def extract_gemini_tools(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
+        tools = body.get("tools")
+        if not isinstance(tools, list):
+            return [], ""
+        candidates = []
+        key_used = "functionDeclarations"
+        for item in tools:
+            if not isinstance(item, dict):
+                continue
+            if "functionDeclarations" in item and isinstance(item["functionDeclarations"], list):
+                candidates.extend(item["functionDeclarations"])
+                key_used = "functionDeclarations"
+            elif "function_declarations" in item and isinstance(item["function_declarations"], list):
+                candidates.extend(item["function_declarations"])
+                key_used = "function_declarations"
+        return candidates, key_used
+
+    def extract_gemini_prompt(body: Dict[str, Any]) -> str:
+        contents = body.get("contents")
+        if not isinstance(contents, list) or not contents:
+            return ""
+        for turn in reversed(contents):
+            if isinstance(turn, dict) and turn.get("role") == "user":
+                parts = turn.get("parts")
+                if isinstance(parts, list):
+                    texts = [
+                        p.get("text", "")
+                        for p in parts
+                        if isinstance(p, dict) and isinstance(p.get("text"), str)
+                    ]
+                    if texts:
+                        return "\n".join(texts).strip()
+        return ""
+
+    def extract_gemini_context(body: Dict[str, Any]) -> str:
+        contents = body.get("contents")
+        if not isinstance(contents, list) or not contents:
+            return ""
+        recent_texts = []
+        for turn in contents[-4:-1]:
+            if isinstance(turn, dict):
+                role = turn.get("role", "turn")
+                parts = turn.get("parts", [])
+                if isinstance(parts, list):
+                    for p in parts:
+                        if isinstance(p, dict) and isinstance(p.get("text"), str):
+                            t = p["text"].strip()
+                            if t:
+                                recent_texts.append(f"{role}: {t[:200]}")
+        return "\n".join(recent_texts)
+
+    def is_gemini_tool_loop(body: Dict[str, Any]) -> bool:
+        contents = body.get("contents")
+        if not isinstance(contents, list) or not contents:
+            return False
+        last_turn = contents[-1]
+        if isinstance(last_turn, dict):
+            parts = last_turn.get("parts", [])
+            if isinstance(parts, list):
+                for p in parts:
+                    if isinstance(p, dict) and (
+                        "functionResponse" in p
+                        or "function_response" in p
+                        or "tool_result" in p
+                    ):
+                        return True
+        return False
+
+    @app.post("/v1internal:streamGenerateContent", include_in_schema=False)
+    @app.post("/v1internal:generateContent", include_in_schema=False)
+    @app.post("/v1/v1internal:streamGenerateContent", include_in_schema=False)
+    @app.post("/v1/v1internal:generateContent", include_in_schema=False)
+    async def google_stream_generate_content(request: Request, bg: BackgroundTasks):
+        started = time.perf_counter()
+        req_id = f"req_{uuid.uuid4().hex[:8]}"
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        session_id = (
+            request.headers.get("x-session-id")
+            or request.headers.get("x-agent-session-id")
+            or request.headers.get("trace")
+            or "antigravity-session"
+        )
+        prompt = extract_gemini_prompt(body)
+        context = extract_gemini_context(body)
+        candidate_tools, fn_key = extract_gemini_tools(body)
+        tools_before = len(candidate_tools)
+        model = str(body.get("model", "") or "gemini")
+
+        route = "Bypass"
+        tool_action = "Bypassed"
+        decision_reason = "default"
+        selected_tool_names = [_tool_name(t) for t in candidate_tools]
+        tools_after = tools_before
+
+        if tools_before > 0:
+            if is_gemini_tool_loop(body):
+                route = "ToolLoop"
+                tool_action = "Unmodified"
+                decision_reason = "mid_tool_loop"
+            else:
+                try:
+                    pruned = await route_tools_via_jev(
+                        prompt=prompt,
+                        tools=candidate_tools,
+                        context=context,
+                        settings=cfg(),
+                    )
+                    tools_after = len(pruned)
+                    selected_tool_names = [_tool_name(t) for t in pruned]
+                    if tools_after == 0:
+                        route = "Jev-Strip"
+                        tool_action = "Stripped-ZeroTokens"
+                        decision_reason = "no_tools"
+                        body.pop("tools", None)
+                    else:
+                        route = "Jev-Routed"
+                        tool_action = f"Retained-{tools_after}"
+                        decision_reason = "pruned_via_jev"
+                        orig_tools = body.get("tools", [])
+                        new_tools = []
+                        for t in orig_tools:
+                            if isinstance(t, dict):
+                                t_copy = dict(t)
+                                if fn_key in t_copy:
+                                    t_copy[fn_key] = pruned
+                                new_tools.append(t_copy)
+                        body["tools"] = new_tools
+                except Exception as exc:
+                    route = "FailOpen"
+                    tool_action = "Unmodified"
+                    decision_reason = f"error_{type(exc).__name__}"
+
+        target_action = request.url.path.lstrip("/").replace("v1/", "")
+        url = google_upstream_url(target_action)
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = google_forward_headers(request)
+        client = upstream_client()
+
+        try:
+            req = client.build_request("POST", url, json=body, headers=headers)
+            upstream = await client.send(req, stream=True)
+        except Exception as exc:
+            await _close_quietly(None, client)
+            elapsed = (time.perf_counter() - started) * 1000
+            audit({
+                "req_id": req_id,
+                "surface": "google",
+                "agent": "antigravity",
+                "session_id": session_id,
+                "model": model,
+                "route": route,
+                "tool_action": tool_action,
+                "reason": f"upstream_failed: {exc}",
+                "tools_before": tools_before,
+                "tools_after": tools_after,
+                "latency_ms": round(elapsed, 2),
+                "error": str(exc),
+            })
+            return JSONResponse(
+                {"error": {"message": f"Upstream Google CloudCode failed: {exc}", "type": "upstream_error"}},
+                status_code=502,
+            )
+
+        elapsed = (time.perf_counter() - started) * 1000
+        audit({
+            "req_id": req_id,
+            "surface": "google",
+            "agent": "antigravity",
+            "session_id": session_id,
+            "model": model,
+            "route": route,
+            "tool_action": tool_action,
+            "reason": decision_reason,
+            "tools_before": tools_before,
+            "tools_after": tools_after,
+            "selected_tools": selected_tool_names,
+            "selected_tool_count": len(selected_tool_names),
+            "selective_dropped": max(0, tools_before - tools_after),
+            "latency_ms": round(elapsed, 2),
+        })
+
+        resp_headers = dict(upstream.headers)
+        resp_headers.pop("content-length", None)
+        resp_headers.pop("content-encoding", None)
+        resp_headers.update(telemetry(
+            route, tool_action, elapsed, 0, req_id, 0, (tools_before, tools_after)
+        ))
+
+        async def stream_raw():
+            try:
+                async for chunk in _iter_bytes(upstream):
+                    yield chunk
+            finally:
+                await _close_quietly(upstream, client)
+
+        return StreamingResponse(
+            stream_raw(),
+            status_code=upstream.status_code,
+            headers=resp_headers,
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
+
+    @app.api_route("/v1internal:{action}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    @app.api_route("/v1internal/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    @app.api_route("/v1/v1internal:{action}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    @app.api_route("/v1/v1internal/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    async def google_v1internal_passthrough(
+        request: Request, action: str = "", path: str = ""
+    ):
+        target_action = action or path
+        subpath = f"v1internal:{target_action}" if action else f"v1internal/{target_action}"
+        url = google_upstream_url(subpath)
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = google_forward_headers(request)
+        client = upstream_client()
+        try:
+            content = await request.body()
+            req = client.build_request(
+                request.method, url, content=content, headers=headers
+            )
+            upstream = await client.send(req, stream=True)
+        except Exception as exc:
+            await _close_quietly(None, client)
+            return JSONResponse(
+                {"error": {"message": f"Upstream Google CloudCode failed: {exc}", "type": "upstream_error"}},
+                status_code=502,
+            )
+
+        resp_headers = dict(upstream.headers)
+        resp_headers.pop("content-length", None)
+        resp_headers.pop("content-encoding", None)
+
+        async def stream_raw():
+            try:
+                async for chunk in _iter_bytes(upstream):
+                    yield chunk
+            finally:
+                await _close_quietly(upstream, client)
+
+        return StreamingResponse(
+            stream_raw(),
+            status_code=upstream.status_code,
+            headers=resp_headers,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
+
+    @app.api_route("/v1beta/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    async def google_v1beta_passthrough(request: Request, path: str = ""):
+        if ":streamGenerateContent" in path or ":generateContent" in path:
+            return await google_stream_generate_content(request, BackgroundTasks())
+
+        url = google_upstream_url(f"v1beta/{path}")
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = google_forward_headers(request)
+        client = upstream_client()
+        try:
+            content = await request.body()
+            req = client.build_request(
+                request.method, url, content=content, headers=headers
+            )
+            upstream = await client.send(req, stream=True)
+        except Exception as exc:
+            await _close_quietly(None, client)
+            return JSONResponse(
+                {"error": {"message": f"Upstream Google endpoint failed: {exc}", "type": "upstream_error"}},
+                status_code=502,
+            )
+
+        resp_headers = dict(upstream.headers)
+        resp_headers.pop("content-length", None)
+        resp_headers.pop("content-encoding", None)
+
+        async def stream_raw():
+            try:
+                async for chunk in _iter_bytes(upstream):
+                    yield chunk
+            finally:
+                await _close_quietly(upstream, client)
+
+        return StreamingResponse(
+            stream_raw(),
+            status_code=upstream.status_code,
+            headers=resp_headers,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
+
+    # ----------------------------------------------------------------------
     # Embedded web dashboard (GET /ui + its JSON endpoints)
     # ----------------------------------------------------------------------
     @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
