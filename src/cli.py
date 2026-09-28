@@ -1337,11 +1337,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         pass
 
     atexit.register(_cleanup)
+    stdin_handle = None
+    try:
+        if sys.stdin is not None:
+            sys.stdin.fileno()
+            stdin_handle = sys.stdin
+    except Exception:
+        stdin_handle = None
+
     try:
         proc = subprocess.Popen(
             command,
             env=environment,
-            stdin=sys.stdin,
+            stdin=stdin_handle,
             stdout=sys.stdout,
             stderr=sys.stderr,
         )

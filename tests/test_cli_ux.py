@@ -303,15 +303,10 @@ def test_run_rejects_unknown_agents_with_a_hint():
     assert any("claude" in hint for hint in excinfo.value.hints)
 
 
-def test_run_rejects_a_missing_binary_without_a_traceback():
-    import shutil
-
+def test_run_rejects_a_missing_binary_without_a_traceback(monkeypatch):
+    monkeypatch.setattr(cli, "resolve_agent_path", lambda _agent: None)
     with pytest.raises(CliError) as excinfo:
-        cli.cmd_run(
-            cli.build_parser().parse_args(
-                ["run", "claude", "--no such binary--"] if shutil.which("claude") else ["run", "claude"]
-            )
-        )
+        cli.cmd_run(cli.build_parser().parse_args(["run", "claude"]))
     message = excinfo.value.message
     assert "not installed" in message or "not on PATH" in message
 

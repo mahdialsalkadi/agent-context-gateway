@@ -337,6 +337,8 @@ SKILL_MARKDOWN_TEMPLATE = """---
 name: jev-router
 description: Semantic tool router powered by local Vulkan-accelerated Jev-2B. Prunes tool candidates to minimal required subset for 0$ token spend. Before executing actions or selecting tools from the catalog, run the jev-router skill to determine the exact minimal tool subset required for the user's turn.
 version: 1.0.0
+allowed-tools:
+  - Bash
 metadata:
   icon: router
 ---
