@@ -31,6 +31,7 @@ import socket
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
@@ -1051,6 +1052,18 @@ def create_app(
             return f"{base}/{action}"
         return base
 
+    def get_antigravity_token() -> str:
+        token_file = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        if token_file.exists():
+            try:
+                data = json.loads(token_file.read_text(encoding="utf-8"))
+                token = data.get("token", {}).get("access_token")
+                if token:
+                    return str(token)
+            except Exception:
+                pass
+        return ""
+
     def google_forward_headers(request: Request) -> Dict[str, str]:
         headers = {}
         for k, v in request.headers.items():
@@ -1063,6 +1076,11 @@ def create_app(
         )
         if auth and "authorization" not in headers:
             headers["authorization"] = auth
+        curr_auth = headers.get("authorization", "").strip()
+        if not curr_auth or curr_auth.lower() in ("bearer", "bearer dummy", "dummy"):
+            ag_token = get_antigravity_token()
+            if ag_token:
+                headers["authorization"] = f"Bearer {ag_token}"
         return headers
 
     def extract_gemini_tools(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
@@ -1204,8 +1222,22 @@ def create_app(
                     tool_action = "Unmodified"
                     decision_reason = f"error_{type(exc).__name__}"
 
-        target_action = request.url.path.lstrip("/").replace("v1/", "")
-        url = google_upstream_url(target_action)
+        # Infer model from path if not explicitly provided
+        if ":streamGenerateContent" in request.url.path or ":generateContent" in request.url.path:
+            parts = request.url.path.split(":")
+            if "/" in parts[0]:
+                inferred_model = parts[0].split("/")[-1]
+                if inferred_model and not body.get("model"):
+                    body["model"] = inferred_model
+                    model = inferred_model
+
+        base_url = google_upstream_url()
+        if "daily-cloudcode" in base_url or "googleapis.com" in base_url:
+            # Google CloudCode PA backend expects /v1internal:streamGenerateContent
+            url = f"{base_url}/v1internal:streamGenerateContent"
+        else:
+            target_action = request.url.path.lstrip("/").replace("v1/", "")
+            url = google_upstream_url(target_action)
         if request.url.query:
             url = f"{url}?{request.url.query}"
 
