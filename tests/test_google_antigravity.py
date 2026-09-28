@@ -407,3 +407,100 @@ def test_google_oauth_token_auto_refresh(tmp_path, monkeypatch):
     updated_data = json.loads(token_file.read_text())
     assert updated_data["token"]["access_token"] == "ya29.freshly_refreshed_token"
 
+
+@pytest.mark.asyncio
+async def test_google_stream_generate_content_deduplicates_duplicate_tools(app_and_audit):
+    app, audit_file, transport = app_and_audit
+    client = TestClient(app)
+
+    # Incoming payload with duplicate view_file across separate items and within same item
+    duplicate_tools_payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": "Please read config.json"}],
+            }
+        ],
+        "tools": [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "view_file",
+                        "description": "Built-in view file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    },
+                    {
+                        "name": "view_file",
+                        "description": "Skill duplicate view file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    },
+                    {
+                        "name": "run_command",
+                        "description": "Run shell command",
+                    },
+                ]
+            },
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "view_file",
+                        "description": "Third duplicate view file in separate container",
+                    }
+                ]
+            },
+        ],
+    }
+
+    # Simulate Jev returning duplicate view_file in selection
+    mock_jev_pruned = [
+        {
+            "name": "view_file",
+            "description": "Built-in view file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+        {
+            "name": "view_file",
+            "description": "Duplicate returned by Jev",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    ]
+
+    with patch(
+        "src.gateway.route_tools_via_jev",
+        new=AsyncMock(return_value=mock_jev_pruned),
+    ):
+        resp = client.post(
+            "/v1internal:streamGenerateContent?alt=sse",
+            json=duplicate_tools_payload,
+            headers={"authorization": "Bearer ya29.test_token"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.headers["X-Proxy-Route"] == "Jev-Routed"
+        # 2 unique candidate tools ingested (view_file, run_command), 1 retained after Jev
+        assert resp.headers["X-Proxy-Tools-Before"] == "2"
+        assert resp.headers["X-Proxy-Tools-After"] == "1"
+
+        # Verify forwarded request to Google CloudCode PA
+        assert len(transport.recorded) == 1
+        req = transport.recorded[0]
+        fwd_body = json.loads(req.content)
+        target = fwd_body.get("request", fwd_body)
+
+        # Assert exactly ONE functionDeclarations list with exactly ONE view_file declaration
+        assert "tools" in target
+        assert len(target["tools"]) == 1
+        assert "functionDeclarations" in target["tools"][0]
+        decls = target["tools"][0]["functionDeclarations"]
+        assert len(decls) == 1
+        assert decls[0]["name"] == "view_file"
+
+        # Verify audit log entry reflects deduplicated tools
+        lines = [json.loads(l) for l in audit_file.read_text().splitlines() if l.strip()]
+        assert len(lines) >= 1
+        audit_entry = lines[-1]
+        assert audit_entry["tools_before"] == 2
+        assert audit_entry["tools_after"] == 1
+        assert audit_entry["selected_tools"] == ["view_file"]
+
+

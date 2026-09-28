@@ -1150,24 +1150,37 @@ def create_app(
         return headers
 
     def extract_gemini_tools(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
-        tools = body.get("tools")
+        target = body.get("request") if isinstance(body.get("request"), dict) else body
+        tools = target.get("tools")
         if not isinstance(tools, list):
-            return [], ""
+            return [], "functionDeclarations"
         candidates = []
+        seen_names = set()
         key_used = "functionDeclarations"
         for item in tools:
             if not isinstance(item, dict):
                 continue
+            decls = []
             if "functionDeclarations" in item and isinstance(item["functionDeclarations"], list):
-                candidates.extend(item["functionDeclarations"])
+                decls = item["functionDeclarations"]
                 key_used = "functionDeclarations"
             elif "function_declarations" in item and isinstance(item["function_declarations"], list):
-                candidates.extend(item["function_declarations"])
+                decls = item["function_declarations"]
                 key_used = "function_declarations"
+            for decl in decls:
+                if isinstance(decl, dict):
+                    name = decl.get("name")
+                    if name:
+                        if name not in seen_names:
+                            seen_names.add(name)
+                            candidates.append(decl)
+                    else:
+                        candidates.append(decl)
         return candidates, key_used
 
     def extract_gemini_prompt(body: Dict[str, Any]) -> str:
-        contents = body.get("contents")
+        target = body.get("request") if isinstance(body.get("request"), dict) else body
+        contents = target.get("contents")
         if not isinstance(contents, list) or not contents:
             return ""
         for turn in reversed(contents):
@@ -1184,7 +1197,8 @@ def create_app(
         return ""
 
     def extract_gemini_context(body: Dict[str, Any]) -> str:
-        contents = body.get("contents")
+        target = body.get("request") if isinstance(body.get("request"), dict) else body
+        contents = target.get("contents")
         if not isinstance(contents, list) or not contents:
             return ""
         recent_texts = []
@@ -1201,7 +1215,8 @@ def create_app(
         return "\n".join(recent_texts)
 
     def is_gemini_tool_loop(body: Dict[str, Any]) -> bool:
-        contents = body.get("contents")
+        target = body.get("request") if isinstance(body.get("request"), dict) else body
+        contents = target.get("contents")
         if not isinstance(contents, list) or not contents:
             return False
         last_turn = contents[-1]
@@ -1247,14 +1262,15 @@ def create_app(
         route = "Bypass"
         tool_action = "Bypassed"
         decision_reason = "default"
-        selected_tool_names = [_tool_name(t) for t in candidate_tools]
-        tools_after = tools_before
+        selected_tool_names = list(dict.fromkeys([_tool_name(t) for t in candidate_tools if _tool_name(t)]))
+        final_declarations: List[Dict[str, Any]] = candidate_tools
 
         if tools_before > 0:
             if is_gemini_tool_loop(body):
                 route = "ToolLoop"
                 tool_action = "Unmodified"
                 decision_reason = "mid_tool_loop"
+                final_declarations = candidate_tools
             else:
                 try:
                     pruned = await route_tools_via_jev(
@@ -1263,30 +1279,82 @@ def create_app(
                         context=context,
                         settings=cfg(),
                     )
-                    tools_after = len(pruned)
-                    selected_tool_names = [_tool_name(t) for t in pruned]
-                    if tools_after == 0:
+                    # 2. Deduplicate Jev Selection
+                    raw_selected = (
+                        getattr(pruned, "selected_names", None)
+                        or [_tool_name(t) for t in pruned]
+                    )
+                    selected_tool_names = list(
+                        dict.fromkeys([n for n in raw_selected if n])
+                    )
+
+                    seen_pruned = set()
+                    unique_pruned = []
+                    for t in pruned:
+                        n = _tool_name(t)
+                        if n:
+                            if n not in seen_pruned:
+                                seen_pruned.add(n)
+                                unique_pruned.append(t)
+                        else:
+                            unique_pruned.append(t)
+                    final_declarations = unique_pruned
+
+                    if len(final_declarations) == 0:
                         route = "Jev-Strip"
                         tool_action = "Stripped-ZeroTokens"
                         decision_reason = "no_tools"
-                        body.pop("tools", None)
                     else:
                         route = "Jev-Routed"
-                        tool_action = f"Retained-{tools_after}"
+                        tool_action = f"Retained-{len(final_declarations)}"
                         decision_reason = "pruned_via_jev"
-                        orig_tools = body.get("tools", [])
-                        new_tools = []
-                        for t in orig_tools:
-                            if isinstance(t, dict):
-                                t_copy = dict(t)
-                                if fn_key in t_copy:
-                                    t_copy[fn_key] = pruned
-                                new_tools.append(t_copy)
-                        body["tools"] = new_tools
                 except Exception as exc:
                     route = "FailOpen"
                     tool_action = "Unmodified"
                     decision_reason = f"error_{type(exc).__name__}"
+                    final_declarations = candidate_tools
+
+        # 3. Sanitize Outbound Tools Payload
+        seen_names = set()
+        unique_declarations: List[Dict[str, Any]] = []
+        for decl in final_declarations:
+            if isinstance(decl, dict):
+                name = decl.get("name")
+                if name:
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        unique_declarations.append(decl)
+                else:
+                    unique_declarations.append(decl)
+
+        tools_after = len(unique_declarations)
+        selected_tool_names = list(
+            dict.fromkeys([_tool_name(t) for t in unique_declarations if _tool_name(t)])
+        )
+
+        target = body.get("request") if isinstance(body.get("request"), dict) else body
+        if not unique_declarations:
+            target.pop("tools", None)
+            if target is not body:
+                body.pop("tools", None)
+        else:
+            orig_tools = target.get("tools", [])
+            new_tools = []
+            fn_placed = False
+            if isinstance(orig_tools, list):
+                for t in orig_tools:
+                    if isinstance(t, dict):
+                        if fn_key in t:
+                            if not fn_placed:
+                                t_copy = dict(t)
+                                t_copy[fn_key] = unique_declarations
+                                new_tools.append(t_copy)
+                                fn_placed = True
+                        else:
+                            new_tools.append(t)
+            if not fn_placed:
+                new_tools.append({fn_key: unique_declarations})
+            target["tools"] = new_tools
 
         # Infer model from path if not explicitly provided
         clean_path = request.url.path.replace("%3A", ":")

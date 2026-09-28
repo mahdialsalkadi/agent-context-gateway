@@ -366,9 +366,16 @@ async def route_tools_via_jev(
         data = res.json()
         raw_text = reply_text(data)
         chosen_names = parse_jev_tool_selection(raw_text, set(candidate_map.keys()))
+        chosen_names = list(dict.fromkeys(chosen_names))
 
         selected_set = set(chosen_names)
-        filtered = [t for t in tools if _tool_name(t) in selected_set]
+        seen_filtered = set()
+        filtered = []
+        for t in tools:
+            n = _tool_name(t)
+            if n in selected_set and n not in seen_filtered:
+                seen_filtered.add(n)
+                filtered.append(t)
         out = RoutedToolList(filtered)
         out.selected_names = chosen_names
         out.raw_response = raw_text
