@@ -300,3 +300,110 @@ def test_google_stream_generate_content_mid_tool_loop_passthrough(app_and_audit)
     assert resp.headers["X-Proxy-Route"] == "ToolLoop"
     assert resp.headers["X-Proxy-Tools-Before"] == "1"
     assert resp.headers["X-Proxy-Tools-After"] == "1"
+
+
+def test_google_stream_v1beta_model_mapping_and_sse_unwrap(tmp_path):
+    """v1beta requests should map gemini-3.8-flash to tiered and unwrap response in SSE."""
+    recorded_requests = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        recorded_requests.append(request)
+        # CloudCode PA sends data: {"response": {"candidates": [...]}}
+        sse_chunk = (
+            b'data: {"response": {"candidates": [{"content": {"parts": [{"text": "Hello"}], "role": "model"}}]}}\n\n'
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse_chunk)
+
+    mock_transport = httpx.MockTransport(mock_handler)
+    settings = load_settings(env={"UPSTREAM_BASE_URL": "https://daily-cloudcode-pa.googleapis.com", "AGENT_GATEWAY_DATA_DIR": str(tmp_path)})
+    app = create_app(settings=settings, upstream_transport=mock_transport)
+    client = TestClient(app)
+
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [],
+    }
+
+    resp = client.post(
+        "/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
+        json=payload,
+        headers={"authorization": "Bearer ya29.test-token"},
+    )
+    assert resp.status_code == 200
+    assert len(recorded_requests) == 1
+    req = recorded_requests[0]
+    body = json.loads(req.content)
+    assert body["project"] == "aicode-consumers"
+    assert body["model"] == "gemini-3.8-flash-tiered"
+    assert "contents" in body["request"]
+
+    # Verify SSE unwrapping from {"response": {"candidates": ...}} to {"candidates": ...}
+    assert b'"candidates"' in resp.content
+    assert b'"response"' not in resp.content
+
+
+def test_cli_restart_agy():
+    from src.cli import main
+
+    with patch("src.cli.cmd_restart_agy", return_value=0) as mock_cmd:
+        res = main(["restart-agy", "--print", "say hello"])
+        assert res == 0
+        assert mock_cmd.called
+        args = mock_cmd.call_args[0][0]
+        assert args.agy_args == ["--print", "say hello"]
+
+
+def test_google_oauth_token_auto_refresh(tmp_path, monkeypatch):
+    """Test get_antigravity_token triggers OAuth refresh when expired."""
+    from datetime import datetime, timezone, timedelta
+
+    token_dir = tmp_path / ".gemini" / "antigravity-cli"
+    token_dir.mkdir(parents=True)
+    token_file = token_dir / "antigravity-oauth-token"
+
+    expired_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    initial_data = {
+        "token": {
+            "access_token": "ya29.old_token",
+            "refresh_token": "1//test_refresh",
+            "expiry": expired_time,
+        }
+    }
+    token_file.write_text(json.dumps(initial_data))
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    # Mock httpx.Client post to Google OAuth endpoint
+    mock_refresh_response = {
+        "access_token": "ya29.freshly_refreshed_token",
+        "expires_in": 3600,
+        "token_type": "Bearer",
+    }
+
+    class MockHttpxClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, data=None, **kwargs):
+            assert "oauth2.googleapis.com" in url
+            assert "client_id" in data and len(data["client_id"]) > 10
+            assert "client_secret" in data and len(data["client_secret"]) > 10
+            assert data["refresh_token"] == "1//test_refresh"
+            return httpx.Response(200, json=mock_refresh_response)
+
+    monkeypatch.setattr("httpx.Client", MockHttpxClient)
+
+    # Create app to test get_antigravity_token
+    settings = load_settings()
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    # Calling a Google endpoint without auth should trigger token read & auto-refresh
+    resp = client.get("/v1internal:loadCodeAssist")
+    # Verify the token file on disk was updated with new token
+    updated_data = json.loads(token_file.read_text())
+    assert updated_data["token"]["access_token"] == "ya29.freshly_refreshed_token"
+

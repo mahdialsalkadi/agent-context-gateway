@@ -1391,6 +1391,89 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 
 # ------------------------------------------------------------------------------
+# `agent-gateway restart-agy` -- kill lingering sessions and launch bound to :8091
+# ------------------------------------------------------------------------------
+def cmd_restart_agy(args: argparse.Namespace) -> int:
+    import shutil
+    import signal
+    import time
+    from . import ux
+
+    sys.stderr.write(ux.cyan("[restart-agy] Restarting Antigravity (agy) session bound to gateway...\n"))
+
+    # Protect current process and all its ancestors from termination
+    ancestors = set()
+    curr = os.getpid()
+    while curr > 1:
+        ancestors.add(curr)
+        try:
+            with open(f"/proc/{curr}/stat", "r") as f:
+                ppid = int(f.read().split()[3])
+            if ppid in ancestors or ppid <= 1:
+                break
+            ancestors.add(ppid)
+            curr = ppid
+        except Exception:
+            break
+
+    # 1. Terminate lingering agy processes (excluding ourselves and ancestors)
+    terminated = 0
+    try:
+        for proc_dir in Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            pid = int(proc_dir.name)
+            if pid in ancestors:
+                continue
+            try:
+                cmdline_file = proc_dir / "cmdline"
+                if not cmdline_file.exists():
+                    continue
+                cmdline = cmdline_file.read_bytes().split(b"\x00")
+                if not cmdline or not cmdline[0]:
+                    continue
+                exe = cmdline[0].decode("utf-8", errors="ignore")
+                if (exe.endswith("/agy") or exe == "agy") and "python" not in exe:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        terminated += 1
+                    except ProcessLookupError:
+                        pass
+            except (PermissionError, FileNotFoundError):
+                continue
+    except Exception as exc:
+        sys.stderr.write(ux.yellow(f"[restart-agy] Warning checking lingering agy processes: {exc}\n"))
+
+    if terminated:
+        sys.stderr.write(ux.green(f"[restart-agy] Terminated {terminated} lingering agy process(es).\n"))
+        time.sleep(0.5)
+
+    # 2. Ensure gateway is running
+    _ensure_gateway_running(owner_pid=None)
+
+    from .config import load_settings
+    settings = load_settings()
+    gw_port = settings.port or 8091
+
+    # 3. Configure environment with AGY gateway URL
+    env = os.environ.copy()
+    env["AGY_GATEWAY_URL"] = f"http://127.0.0.1:{gw_port}"
+    for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        env.pop(proxy_var, None)
+
+    agy_bin = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
+    extra_args = getattr(args, "agy_args", []) or []
+
+    sys.stderr.write(ux.green(f"[restart-agy] Spawning agy session with AGY_GATEWAY_URL=http://127.0.0.1:{gw_port}\n"))
+    try:
+        os.execvpe(agy_bin, [agy_bin, *extra_args], env)
+    except Exception as exc:
+        sys.stderr.write(ux.red(f"[restart-agy] Failed to exec agy: {exc}\n"))
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------------------------
 # Global wrapper: one `agent-gateway` command from any directory and any shell
 # ------------------------------------------------------------------------------
 WRAPPER_TEMPLATE = """\
@@ -2229,10 +2312,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     shim.set_defaults(func=cmd_install_shim)
 
+    restart_agy = subparsers.add_parser(
+        "restart-agy",
+        help="kill lingering agy sessions and launch fresh session bound to gateway",
+    )
+    restart_agy.add_argument(
+        "agy_args", nargs=argparse.REMAINDER, help="extra arguments passed directly to agy"
+    )
+    restart_agy.set_defaults(func=cmd_restart_agy)
+
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "restart-agy":
+        args = argparse.Namespace(func=cmd_restart_agy, agy_args=argv[1:])
+        try:
+            return cmd_restart_agy(args)
+        except CliError as error:
+            from . import ux
+
+            ux.render_error(error)
+            return 1
+        except KeyboardInterrupt:
+            sys.stderr.write("\n[interrupted]\n")
+            return 130
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
