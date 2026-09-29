@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -235,6 +236,40 @@ def _safe_stderr(text: str) -> None:
         pass
 
 
+def _systemd_service_active(service_name: str = "agent-gateway.service") -> bool:
+    """True when systemd --user service is actively running."""
+    import shutil
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", service_name],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        return res.returncode == 0 and res.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def _systemd_service_control(action: str, service_name: str = "agent-gateway.service") -> bool:
+    """Run systemctl --user <action> <service_name>."""
+    import shutil
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", action, service_name],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     from .config import load_settings
 
@@ -245,9 +280,20 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
         stop_local_jev(settings)
 
+    stopped_systemd = False
+    if _systemd_service_active():
+        _systemd_service_control("stop")
+        stopped_systemd = True
+
     pid = _read_pid()
     if not _pid_alive(pid):
         _clear_pid()
+        if stopped_systemd:
+            if not keep_jev:
+                _safe_stderr("[Stopped] Gateway systemd service and local Jev stopped.\n")
+            else:
+                _safe_stderr("[cli] gateway systemd service stopped.\n")
+            return 0
         if _probe_health(timeout=1.0) is not None:
             _safe_stderr(
                 "[cli] something answers on the port, but it was not started by "
@@ -537,14 +583,24 @@ def cmd_service(args: argparse.Namespace) -> int:
 # shared low-level helpers used by the UX commands
 # ------------------------------------------------------------------------------
 def _gateway_healthy() -> bool:
-    """True when OUR gateway answers on the configured port."""
+    """True when OUR gateway answers on the configured port and matching upstream."""
     health = _probe_health(timeout=1.5)
     if not health:
         return False
     from .config import load_settings
 
+    settings = load_settings()
     # Identity, not just a 200: the payload must carry our data dir.
-    return str(health.get("data_dir") or "") == str(load_settings().data_dir)
+    if str(health.get("data_dir") or "") != str(settings.data_dir):
+        return False
+
+    # Upstream must match configured upstream so changes take effect
+    health_upstream = str(health.get("upstream") or "").rstrip("/")
+    cfg_upstream = str(settings.upstream_base_url or "").rstrip("/")
+    if health_upstream and cfg_upstream and health_upstream != cfg_upstream:
+        return False
+
+    return True
 
 
 def _ensure_gateway_running(owner_pid: Optional[int] = None) -> int:
@@ -1064,6 +1120,8 @@ RUN_AGENTS = {
     "antigravity": {
         "binary": "agy",
         "env": {
+            "AGY_GATEWAY_URL": "http://127.0.0.1:{port}",
+            "AGY_PROXY_URL": "http://127.0.0.1:{port}",
             "HTTP_PROXY": "http://127.0.0.1:{port}",
             "HTTPS_PROXY": "http://127.0.0.1:{port}",
             "ALL_PROXY": "http://127.0.0.1:{port}",
@@ -1275,6 +1333,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             stream=sys.stderr,
         )
     )
+
+    if agent == "hermes":
+        purge_hermes_proxy_cache(settings.port)
 
     model = (
         getattr(args, "model", None)
@@ -1560,6 +1621,289 @@ def cmd_install_shim(args: argparse.Namespace) -> int:
         sys.stderr.write(path_guidance(path.parent) + "\n")
     else:
         sys.stderr.write(f"[cli] {path.parent} is already on PATH -- run `agent-gateway` from anywhere.\n")
+    return 0
+
+
+def purge_hermes_proxy_cache(port: Optional[int] = None) -> None:
+    """Invalidate cached models for custom gateway proxies in Hermes."""
+    import json
+    hermes_dir = Path.home() / ".hermes"
+    cache_path = hermes_dir / "provider_models_cache.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            changed = False
+            port_str = str(port) if port else ""
+            keys_to_delete = [
+                k
+                for k in list(cache.keys())
+                if ("127.0.0.1" in k or "localhost" in k)
+                and ("809" in k or (port_str and port_str in k))
+            ]
+            for k in keys_to_delete:
+                del cache[k]
+                changed = True
+            if changed:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2)
+        except Exception:
+            pass
+
+    config_path = hermes_dir / "config.yaml"
+    if config_path.exists():
+        try:
+            import yaml
+
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict) and "custom_providers" in data and isinstance(data["custom_providers"], list):
+                changed = False
+                for p in data["custom_providers"]:
+                    if isinstance(p, dict) and (p.get("name") == "hermes-proxy" or "809" in str(p.get("base_url", ""))):
+                        if p.get("models_discovered") is not False:
+                            p["models_discovered"] = False
+                            changed = True
+                        if p.get("models"):
+                            p["models"] = {}
+                            changed = True
+                if changed:
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        yaml.safe_dump(data, f)
+        except Exception:
+            pass
+
+
+SHELL_BLOCK_START = "# >>> agent-context-gateway >>>"
+SHELL_BLOCK_END = "# <<< agent-context-gateway <<<"
+
+
+def _update_shell_file(
+    path: Path, block_lines: List[str], clean_patterns: Optional[List[str]] = None
+) -> bool:
+    """Idempotently insert or update the agent-context-gateway block in a shell config file."""
+    if not path.parent.exists():
+        return False
+    content = ""
+    if path.exists():
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+
+    lines = content.splitlines()
+    new_lines: List[str] = []
+    in_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == SHELL_BLOCK_START:
+            in_block = True
+            continue
+        if stripped == SHELL_BLOCK_END:
+            in_block = False
+            continue
+        if in_block:
+            continue
+        if clean_patterns and any(re.search(pat, line) for pat in clean_patterns):
+            continue
+        new_lines.append(line)
+
+    if new_lines and new_lines[-1].strip():
+        new_lines.append("")
+    new_lines.append(SHELL_BLOCK_START)
+    new_lines.extend(block_lines)
+    new_lines.append(SHELL_BLOCK_END)
+    new_lines.append("")
+
+    try:
+        path.write_text("\n".join(new_lines), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def integrate_shell_environment(port: int = 8091) -> List[str]:
+    """Configure shell environment files (fish, bash, zsh) for persistent gateway routing."""
+    home = Path.home()
+    updated: List[str] = []
+
+    # 1. Fish: ~/.config/fish/config.fish
+    fish_config = home / ".config" / "fish" / "config.fish"
+    if fish_config.exists() or fish_config.parent.exists():
+        fish_lines = [
+            f'set -gx AGY_GATEWAY_URL "http://127.0.0.1:{port}"',
+            f'set -gx ANTHROPIC_BASE_URL "http://127.0.0.1:{port}"',
+            f'set -gx OPENAI_BASE_URL "http://127.0.0.1:{port}/v1"',
+            f'set -gx OPENAI_API_KEY "dummy"',
+        ]
+        if _update_shell_file(fish_config, fish_lines):
+            updated.append(str(fish_config))
+
+    # Clean patterns to remove broken legacy aliases and harmful HTTP_PROXY exports
+    clean_patterns = [
+        r"export\s+(?:HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)=.*:809",
+        r"alias\s+agy=.*809",
+    ]
+
+    # 2. Bash: ~/.bashrc
+    bash_rc = home / ".bashrc"
+    if bash_rc.exists():
+        bash_lines = [
+            f'export AGY_GATEWAY_URL="http://127.0.0.1:{port}"',
+            f'export ANTHROPIC_BASE_URL="http://127.0.0.1:{port}"',
+            f'export OPENAI_BASE_URL="http://127.0.0.1:{port}/v1"',
+            f'export OPENAI_API_KEY="dummy"',
+        ]
+        if _update_shell_file(bash_rc, bash_lines, clean_patterns=clean_patterns):
+            updated.append(str(bash_rc))
+
+    # 3. Zsh: ~/.zshrc
+    zsh_rc = home / ".zshrc"
+    if zsh_rc.exists():
+        zsh_lines = [
+            f'export AGY_GATEWAY_URL="http://127.0.0.1:{port}"',
+            f'export ANTHROPIC_BASE_URL="http://127.0.0.1:{port}"',
+            f'export OPENAI_BASE_URL="http://127.0.0.1:{port}/v1"',
+            f'export OPENAI_API_KEY="dummy"',
+        ]
+        if _update_shell_file(zsh_rc, zsh_lines, clean_patterns=clean_patterns):
+            updated.append(str(zsh_rc))
+
+    return updated
+
+
+def install_agent_shims(port: int = 8091, bin_dir: Optional[Path] = None) -> List[str]:
+    """Install or update wrapper shims in ~/.local/bin for all supported agents."""
+    installed: List[str] = []
+    target_dir = Path(bin_dir) if bin_dir else Path.home() / ".local" / "bin"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Antigravity: agy
+    agy_shim = target_dir / "agy"
+    agy_real = target_dir / "agy-real"
+
+    if agy_shim.exists() and not agy_real.exists():
+        try:
+            with open(agy_shim, "rb") as f:
+                header = f.read(4)
+            if header == b"\x7fELF":
+                agy_shim.rename(agy_real)
+        except Exception:
+            pass
+
+    agy_wrapper_content = f"""#!/usr/bin/env bash
+# Auto-generated wrapper by agent-context-gateway.
+# Ensures all Antigravity (agy) sessions in any terminal tab or subshell
+# automatically route through the local context-pruning gateway.
+export AGY_GATEWAY_URL="${{AGY_GATEWAY_URL:-http://127.0.0.1:{port}}}"
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+
+BIN_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+if [ -x "$BIN_DIR/agy-real" ]; then
+    exec "$BIN_DIR/agy-real" "$@"
+elif [ -x "$HOME/.local/bin/agy-real" ]; then
+    exec "$HOME/.local/bin/agy-real" "$@"
+else
+    echo "[agent-gateway] Error: agy-real binary not found" >&2
+    exit 1
+fi
+"""
+    try:
+        agy_shim.write_text(agy_wrapper_content, encoding="utf-8")
+        agy_shim.chmod(0o755)
+        installed.append(str(agy_shim))
+    except Exception:
+        pass
+
+    # 2. Hermes: hermes
+    hermes_shim = target_dir / "hermes"
+    hermes_real = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"
+    if hermes_shim.exists() or hermes_real.exists():
+        hermes_wrapper_content = f"""#!/usr/bin/env bash
+# Auto-generated wrapper by agent-context-gateway.
+# Ensures Hermes sessions in any terminal tab automatically route through
+# the local context-pruning gateway.
+unset PYTHONPATH
+unset PYTHONHOME
+export OPENAI_BASE_URL="${{OPENAI_BASE_URL:-http://127.0.0.1:{port}/v1}}"
+export OPENAI_API_KEY="${{OPENAI_API_KEY:-dummy}}"
+
+HERMES_REAL="$HOME/.hermes/hermes-agent/venv/bin/hermes"
+if [ -x "$HERMES_REAL" ]; then
+    exec "$HERMES_REAL" "$@"
+else
+    echo "[agent-gateway] Error: hermes binary not found at $HERMES_REAL" >&2
+    exit 1
+fi
+"""
+        try:
+            hermes_shim.write_text(hermes_wrapper_content, encoding="utf-8")
+            hermes_shim.chmod(0o755)
+            installed.append(str(hermes_shim))
+        except Exception:
+            pass
+
+    # 3. Claude Code: claude
+    import shutil
+
+    claude_sys = shutil.which("claude")
+    claude_shim = target_dir / "claude"
+    if claude_sys and (Path(claude_sys).resolve() != claude_shim.resolve() or claude_shim.exists()):
+        claude_wrapper_content = f"""#!/usr/bin/env bash
+# Auto-generated wrapper by agent-context-gateway.
+# Ensures Claude Code sessions in any terminal tab automatically route
+# through the local context-pruning gateway.
+export ANTHROPIC_BASE_URL="${{ANTHROPIC_BASE_URL:-http://127.0.0.1:{port}}}"
+
+REAL_CLAUDE="/usr/bin/claude"
+if [ ! -x "$REAL_CLAUDE" ]; then
+    REAL_CLAUDE="$(which -a claude 2>/dev/null | grep -v "$HOME/.local/bin/claude" | head -n 1)"
+fi
+
+if [ -x "$REAL_CLAUDE" ]; then
+    exec "$REAL_CLAUDE" "$@"
+else
+    echo "[agent-gateway] Error: real claude binary not found" >&2
+    exit 1
+fi
+"""
+        try:
+            claude_shim.write_text(claude_wrapper_content, encoding="utf-8")
+            claude_shim.chmod(0o755)
+            installed.append(str(claude_shim))
+        except Exception:
+            pass
+
+    return installed
+
+
+def cmd_integrate(args: argparse.Namespace) -> int:
+    """Configure shell environment files and agent wrappers across all terminal tabs."""
+    from . import ux
+    from .config import load_settings
+
+    settings = load_settings()
+    port = getattr(args, "port", None) or settings.port or 8091
+
+    sys.stderr.write(ux.cyan(f"[integrate] Configuring persistent multi-tab environment on port :{port}...\n"))
+
+    updated_shells = integrate_shell_environment(port=port)
+    for s in updated_shells:
+        sys.stderr.write(ux.green(f"  ✔ Configured shell: {s}\n", stream=sys.stderr))
+
+    installed_shims = install_agent_shims(port=port)
+    for sh in installed_shims:
+        sys.stderr.write(ux.green(f"  ✔ Installed agent wrapper: {sh}\n", stream=sys.stderr))
+
+    purge_hermes_proxy_cache(port=port)
+    sys.stderr.write(ux.green(f"  ✔ Purged stale Hermes proxy cache\n", stream=sys.stderr))
+
+    sys.stderr.write(
+        ux.bold(
+            "\n✔ Multi-tab integration complete! All new terminal tabs and agents will automatically route through the gateway.\n",
+            stream=sys.stderr,
+        )
+    )
     return 0
 
 
@@ -2013,6 +2357,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
             default_url = "http://127.0.0.1:11434/v1"
         typed = input_fn(f"Local engine base URL [{default_url}]: ").strip()
         upstream_url = typed or default_url
+        api_key = "dummy"
     else:
         upstream_url = WIZARD_UPSTREAM_URLS[provider]
 
@@ -2118,7 +2463,19 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         jev_api_key=jev_api_key,
     )
     update_env_file(env_path, preset)
+    global_env_path = Path.home() / ".agent-gateway" / ".env"
+    try:
+        update_env_file(global_env_path, preset)
+    except Exception:
+        pass
     os.environ.update({key: str(value) for key, value in preset.items()})
+
+    try:
+        integrate_shell_environment(port=port)
+        install_agent_shims(port=port)
+        purge_hermes_proxy_cache(port=port)
+    except Exception:
+        pass
 
     # --- shim self-heal -------------------------------------------------------
     # The global wrapper is what makes `agent-gateway` work from any directory;
@@ -2144,9 +2501,11 @@ def cmd_interactive(args: argparse.Namespace) -> int:
     )
     sys.stderr.write(ux.dim("agent-gateway wrapper: " + hint, stream=sys.stderr) + "\n")
 
-    # When interactive setup writes a new configuration, stop any old
-    # gateway process running with previous settings so the new setup takes effect.
-    if _pid_alive(_read_pid()):
+    # When interactive setup writes a new configuration, restart systemd service
+    # or stop any old gateway process running with previous settings so the new setup takes effect.
+    if _systemd_service_active():
+        _systemd_service_control("restart")
+    elif _pid_alive(_read_pid()):
         cmd_stop(argparse.Namespace(keep_jev=True))
 
     from .config import load_settings
@@ -2319,6 +2678,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--bin-dir", dest="bin_dir", default=None, help=argparse.SUPPRESS
     )
     shim.set_defaults(func=cmd_install_shim)
+
+    integrate = subparsers.add_parser(
+        "integrate",
+        help="configure shells (fish, bash, zsh) and agent wrappers for automatic multi-tab routing",
+    )
+    integrate.add_argument(
+        "--port", type=int, default=None, help="override the gateway port"
+    )
+    integrate.set_defaults(func=cmd_integrate)
 
     restart_agy = subparsers.add_parser(
         "restart-agy",

@@ -477,12 +477,35 @@ def create_app(
         client = upstream_client()
         try:
             headers = {}
-            auth = upstream_auth_header(
-                cfg().upstream_api_key, client_upstream_auth(request, cfg().gateway_api_key)
-            )
-            if auth:
-                headers["Authorization"] = auth
+            if not cfg().is_local_upstream:
+                auth = upstream_auth_header(
+                    cfg().upstream_api_key, client_upstream_auth(request, cfg().gateway_api_key)
+                )
+                if auth:
+                    headers["Authorization"] = auth
             response = await client.get(f"{cfg().upstream_base_url}/models", headers=headers)
+            if response.status_code == 200:
+                return JSONResponse(response.json(), status_code=200)
+
+            # Fallback for local engines like Ollama if /models returned 404
+            if response.status_code == 404 and cfg().is_local_upstream:
+                base = cfg().upstream_base_url.rstrip("/")
+                if base.endswith("/v1"):
+                    base = base[:-3]
+                tag_resp = await client.get(f"{base}/api/tags")
+                if tag_resp.status_code == 200:
+                    tags_data = tag_resp.json().get("models", [])
+                    models_list = [
+                        {
+                            "id": m.get("name", m.get("model", "unknown")),
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "ollama",
+                        }
+                        for m in tags_data
+                    ]
+                    return JSONResponse({"object": "list", "data": models_list}, status_code=200)
+
             return JSONResponse(response.json(), status_code=response.status_code)
         except Exception as exc:
             return openai_error(f"Upstream /models unavailable: {exc}", 502, "upstream_error")

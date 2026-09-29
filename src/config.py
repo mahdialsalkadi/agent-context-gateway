@@ -383,6 +383,12 @@ class Settings:
         return {"tier": tier, "label": label, "upstream": self.upstream_base_url}
 
     @property
+    def is_local_upstream(self) -> bool:
+        """True when the upstream is an offline engine or local host."""
+        tier, _ = classify_upstream(self.upstream_base_url)
+        return tier == TIER_LOCAL
+
+    @property
     def effective_classifier_mode(self) -> str:
         """The mode actually in force, resolving `auto` from the environment.
 
