@@ -508,6 +508,28 @@ def create_app(
 
             return JSONResponse(response.json(), status_code=response.status_code)
         except Exception as exc:
+            if cfg().is_local_upstream:
+                try:
+                    alt_resp = await client.get("http://127.0.0.1:11435/v1/models", timeout=1.0)
+                    if alt_resp.status_code == 200:
+                        return JSONResponse(alt_resp.json(), status_code=200)
+                except Exception:
+                    pass
+                fallback_model = getattr(cfg(), "hermes_model", "") or "local-model"
+                return JSONResponse(
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": fallback_model,
+                                "object": "model",
+                                "created": int(time.time()),
+                                "owned_by": "local",
+                            }
+                        ],
+                    },
+                    status_code=200,
+                )
             return openai_error(f"Upstream /models unavailable: {exc}", 502, "upstream_error")
         finally:
             await _close_quietly(None, client)

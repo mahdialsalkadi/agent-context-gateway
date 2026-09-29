@@ -1624,22 +1624,24 @@ def cmd_install_shim(args: argparse.Namespace) -> int:
     return 0
 
 
-def purge_hermes_proxy_cache(port: Optional[int] = None) -> None:
-    """Invalidate cached models for custom gateway proxies in Hermes."""
+def purge_hermes_proxy_cache(port: Optional[int] = None, model: Optional[str] = None) -> None:
+    """Invalidate cached models for custom gateway proxies in Hermes and sync config.yaml."""
     import json
+
     hermes_dir = Path.home() / ".hermes"
     cache_path = hermes_dir / "provider_models_cache.json"
+    effective_port = port or 8091
     if cache_path.exists():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cache = json.load(f)
             changed = False
-            port_str = str(port) if port else ""
+            port_str = str(effective_port)
             keys_to_delete = [
                 k
                 for k in list(cache.keys())
                 if ("127.0.0.1" in k or "localhost" in k)
-                and ("809" in k or (port_str and port_str in k))
+                and ("809" in k or port_str in k)
             ]
             for k in keys_to_delete:
                 del cache[k]
@@ -1657,16 +1659,48 @@ def purge_hermes_proxy_cache(port: Optional[int] = None) -> None:
 
             with open(config_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
-            if isinstance(data, dict) and "custom_providers" in data and isinstance(data["custom_providers"], list):
+            if isinstance(data, dict):
                 changed = False
+                if "custom_providers" not in data or not isinstance(data["custom_providers"], list):
+                    data["custom_providers"] = []
+
+                found_proxy = False
                 for p in data["custom_providers"]:
                     if isinstance(p, dict) and (p.get("name") == "hermes-proxy" or "809" in str(p.get("base_url", ""))):
-                        if p.get("models_discovered") is not False:
-                            p["models_discovered"] = False
-                            changed = True
-                        if p.get("models"):
-                            p["models"] = {}
-                            changed = True
+                        p["name"] = "hermes-proxy"
+                        p["base_url"] = f"http://127.0.0.1:{effective_port}/v1"
+                        p["models_discovered"] = False
+                        p["models"] = {}
+                        if model:
+                            p["model"] = model
+                        found_proxy = True
+                        changed = True
+                if not found_proxy:
+                    data["custom_providers"].insert(
+                        0,
+                        {
+                            "name": "hermes-proxy",
+                            "base_url": f"http://127.0.0.1:{effective_port}/v1",
+                            "api_mode": "chat_completions",
+                            "model": model or "qwen/qwen3.6-27b",
+                            "models": {},
+                            "models_discovered": False,
+                        },
+                    )
+                    changed = True
+
+                if "model" in data and isinstance(data["model"], dict):
+                    target_url = f"http://127.0.0.1:{effective_port}/v1"
+                    if data["model"].get("base_url") != target_url:
+                        data["model"]["base_url"] = target_url
+                        changed = True
+                    if data["model"].get("provider") not in ("custom", "hermes-proxy"):
+                        data["model"]["provider"] = "custom"
+                        changed = True
+                    if model and data["model"].get("default") != model:
+                        data["model"]["default"] = model
+                        changed = True
+
                 if changed:
                     with open(config_path, "w", encoding="utf-8") as f:
                         yaml.safe_dump(data, f)
@@ -1732,6 +1766,12 @@ def integrate_shell_environment(port: int = 8091) -> List[str]:
     if fish_config.exists() or fish_config.parent.exists():
         fish_lines = [
             f'set -gx AGY_GATEWAY_URL "http://127.0.0.1:{port}"',
+            f'set -gx AGY_PROXY_URL "http://127.0.0.1:{port}"',
+            f'set -gx GOOGLE_API_ENDPOINT "http://127.0.0.1:{port}"',
+            f'set -gx DAILY_CLOUDCODE_ENDPOINT "http://127.0.0.1:{port}"',
+            f'set -gx CLOUDCODE_BASE_URL "http://127.0.0.1:{port}"',
+            f'set -gx GEMINI_BASE_URL "http://127.0.0.1:{port}/v1"',
+            f'set -gx ANTIGRAVITY_ENDPOINT "http://127.0.0.1:{port}"',
             f'set -gx ANTHROPIC_BASE_URL "http://127.0.0.1:{port}"',
             f'set -gx OPENAI_BASE_URL "http://127.0.0.1:{port}/v1"',
             f'set -gx OPENAI_API_KEY "dummy"',
@@ -1750,6 +1790,12 @@ def integrate_shell_environment(port: int = 8091) -> List[str]:
     if bash_rc.exists():
         bash_lines = [
             f'export AGY_GATEWAY_URL="http://127.0.0.1:{port}"',
+            f'export AGY_PROXY_URL="http://127.0.0.1:{port}"',
+            f'export GOOGLE_API_ENDPOINT="http://127.0.0.1:{port}"',
+            f'export DAILY_CLOUDCODE_ENDPOINT="http://127.0.0.1:{port}"',
+            f'export CLOUDCODE_BASE_URL="http://127.0.0.1:{port}"',
+            f'export GEMINI_BASE_URL="http://127.0.0.1:{port}/v1"',
+            f'export ANTIGRAVITY_ENDPOINT="http://127.0.0.1:{port}"',
             f'export ANTHROPIC_BASE_URL="http://127.0.0.1:{port}"',
             f'export OPENAI_BASE_URL="http://127.0.0.1:{port}/v1"',
             f'export OPENAI_API_KEY="dummy"',
@@ -1762,6 +1808,12 @@ def integrate_shell_environment(port: int = 8091) -> List[str]:
     if zsh_rc.exists():
         zsh_lines = [
             f'export AGY_GATEWAY_URL="http://127.0.0.1:{port}"',
+            f'export AGY_PROXY_URL="http://127.0.0.1:{port}"',
+            f'export GOOGLE_API_ENDPOINT="http://127.0.0.1:{port}"',
+            f'export DAILY_CLOUDCODE_ENDPOINT="http://127.0.0.1:{port}"',
+            f'export CLOUDCODE_BASE_URL="http://127.0.0.1:{port}"',
+            f'export GEMINI_BASE_URL="http://127.0.0.1:{port}/v1"',
+            f'export ANTIGRAVITY_ENDPOINT="http://127.0.0.1:{port}"',
             f'export ANTHROPIC_BASE_URL="http://127.0.0.1:{port}"',
             f'export OPENAI_BASE_URL="http://127.0.0.1:{port}/v1"',
             f'export OPENAI_API_KEY="dummy"',
@@ -1796,6 +1848,12 @@ def install_agent_shims(port: int = 8091, bin_dir: Optional[Path] = None) -> Lis
 # Ensures all Antigravity (agy) sessions in any terminal tab or subshell
 # automatically route through the local context-pruning gateway.
 export AGY_GATEWAY_URL="${{AGY_GATEWAY_URL:-http://127.0.0.1:{port}}}"
+export AGY_PROXY_URL="${{AGY_PROXY_URL:-http://127.0.0.1:{port}}}"
+export GOOGLE_API_ENDPOINT="${{GOOGLE_API_ENDPOINT:-http://127.0.0.1:{port}}}"
+export DAILY_CLOUDCODE_ENDPOINT="${{DAILY_CLOUDCODE_ENDPOINT:-http://127.0.0.1:{port}}}"
+export CLOUDCODE_BASE_URL="${{CLOUDCODE_BASE_URL:-http://127.0.0.1:{port}}}"
+export GEMINI_BASE_URL="${{GEMINI_BASE_URL:-http://127.0.0.1:{port}/v1}}"
+export ANTIGRAVITY_ENDPOINT="${{ANTIGRAVITY_ENDPOINT:-http://127.0.0.1:{port}}}"
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 
 BIN_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"

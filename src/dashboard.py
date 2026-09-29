@@ -289,12 +289,19 @@ def recent_requests(analytics, limit: int = 20) -> list:
     for entry in rows:
         ts = entry.get("ts") or 0
         raw_ts = entry.get("timestamp")
-        if raw_ts:
-            time_display = raw_ts.split("T")[-1][:8] if "T" in str(raw_ts) else str(raw_ts)
-        elif ts:
-            time_display = _time.strftime("%H:%M:%S", _time.localtime(ts))
-        else:
-            time_display = "–"
+        time_display = "–"
+        if ts:
+            try:
+                time_display = _time.strftime("%H:%M:%S", _time.localtime(float(ts)))
+            except Exception:
+                pass
+        elif raw_ts:
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                time_display = dt.astimezone().strftime("%H:%M:%S")
+            except Exception:
+                time_display = raw_ts.split("T")[-1][:8] if "T" in str(raw_ts) else str(raw_ts)
 
         agent = str(entry.get("agent") or entry.get("surface") or "–")
         route = str(entry.get("route") or "unknown")
